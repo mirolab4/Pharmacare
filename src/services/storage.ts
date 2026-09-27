@@ -380,6 +380,7 @@ class PharmacyStorageService {
     if (index >= 0) list[index] = ingredient;
     else list.push(ingredient);
     this.setItem(STORAGE_KEYS.INGREDIENTS, list);
+    firebaseSync.enqueue('ingredients', ingredient.id, ingredient);
     fetch('/api/ingredients', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
@@ -390,6 +391,7 @@ class PharmacyStorageService {
   deleteIngredient(id: string): void {
     const list = this.getIngredients().filter(i => i.id !== id);
     this.setItem(STORAGE_KEYS.INGREDIENTS, list);
+    firebaseSync.enqueue('ingredients', id, null, 'delete');
   }
 
   // التصنيفات
@@ -403,6 +405,7 @@ class PharmacyStorageService {
     if (index >= 0) list[index] = category;
     else list.push(category);
     this.setItem(STORAGE_KEYS.CATEGORIES, list);
+    firebaseSync.enqueue('categories', category.id, category);
     fetch('/api/categories', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
@@ -413,6 +416,7 @@ class PharmacyStorageService {
   deleteCategory(id: string): void {
     const list = this.getCategories().filter(c => c.id !== id);
     this.setItem(STORAGE_KEYS.CATEGORIES, list);
+    firebaseSync.enqueue('categories', id, null, 'delete');
   }
 
   // المصانع
@@ -426,6 +430,7 @@ class PharmacyStorageService {
     if (index >= 0) list[index] = manufacturer;
     else list.push(manufacturer);
     this.setItem(STORAGE_KEYS.MANUFACTURERS, list);
+    firebaseSync.enqueue('manufacturers', manufacturer.id, manufacturer);
     fetch('/api/manufacturers', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
@@ -436,6 +441,7 @@ class PharmacyStorageService {
   deleteManufacturer(id: string): void {
     const list = this.getManufacturers().filter(m => m.id !== id);
     this.setItem(STORAGE_KEYS.MANUFACTURERS, list);
+    firebaseSync.enqueue('manufacturers', id, null, 'delete');
   }
 
   // الأصناف مع الشجرة الذكية للوحدات والأسعار
@@ -505,6 +511,7 @@ class PharmacyStorageService {
     if (index >= 0) list[index] = bank;
     else list.push(bank);
     this.setItem(STORAGE_KEYS.BANKS, list);
+    firebaseSync.enqueue('banks', bank.id, bank);
 
     fetch('/api/banks', {
       method: 'POST',
@@ -516,6 +523,7 @@ class PharmacyStorageService {
   deleteBank(id: string): void {
     const list = this.getBanks().filter(b => b.id !== id);
     this.setItem(STORAGE_KEYS.BANKS, list);
+    firebaseSync.enqueue('banks', id, null, 'delete');
   }
 
   // إضافة أو تعديل حساب فرعي لبنك محدد
@@ -751,6 +759,7 @@ class PharmacyStorageService {
     this.setItem(STORAGE_KEYS.PRODUCTS, products);
     this.setItem(STORAGE_KEYS.STOCK_MOVEMENTS, movements);
     this.setItem(STORAGE_KEYS.INVOICES, invoices);
+    firebaseSync.enqueue('invoices', invoice.id, invoice);
 
     fetch(`/api/invoices/${invoiceId}/cancel`, { method: 'POST' }).catch(() => {});
     return true;
@@ -927,6 +936,7 @@ class PharmacyStorageService {
     this.setItem(STORAGE_KEYS.PRODUCTS, products);
     this.setItem(STORAGE_KEYS.STOCK_MOVEMENTS, movements);
     this.setItem(STORAGE_KEYS.PURCHASES, purchases);
+    firebaseSync.enqueue('purchases', purchase.id, purchase);
 
     fetch(`/api/purchases/${purchaseId}/cancel`, { method: 'POST' }).catch(() => {});
     return true;
@@ -997,6 +1007,7 @@ class PharmacyStorageService {
     }
 
     this.setItem(STORAGE_KEYS.VOUCHERS, vouchers);
+    firebaseSync.enqueue('vouchers', voucher.id, voucher);
 
     fetch('/api/vouchers', {
       method: 'POST',
@@ -1030,6 +1041,7 @@ class PharmacyStorageService {
 
     vouchers.splice(vIndex, 1);
     this.setItem(STORAGE_KEYS.VOUCHERS, vouchers);
+    firebaseSync.enqueue('vouchers', voucherId, null, 'delete');
   }
 
   getNextVoucherNumber(type: 'receipt' | 'payment' | 'journal'): string {
@@ -1182,6 +1194,107 @@ class PharmacyStorageService {
     }
 
     this.setItem(STORAGE_KEYS.PRODUCTS, [...prods, ...newItems]);
+  }
+
+  // --- دوال دمج البيانات السحابية مع المخزن المحلي دون فقدان العمليات المعلقة ---
+  mergeRemoteProducts(remote: Product[]): void {
+    if (!remote || remote.length === 0) return;
+    const local = this.getProducts();
+    const queue = firebaseSync.getQueue();
+    const pendingIds = new Set(queue.filter(q => q.collection === 'products').map(q => q.id));
+
+    const map = new Map<string, Product>();
+    remote.forEach(p => map.set(p.id, p));
+    local.forEach(p => {
+      // إذا كان الصنف عُدّل محلياً أثناء انقطاع النت ولم يُرفع بعد، نحتفظ بالنسخة المحلية
+      if (pendingIds.has(p.id) || !map.has(p.id)) {
+        map.set(p.id, p);
+      }
+    });
+    this.setItem(STORAGE_KEYS.PRODUCTS, Array.from(map.values()));
+  }
+
+  mergeRemoteInvoices(remote: Invoice[]): void {
+    if (!remote || remote.length === 0) return;
+    const local = this.getInvoices();
+    const queue = firebaseSync.getQueue();
+    const pendingIds = new Set(queue.filter(q => q.collection === 'invoices').map(q => q.id));
+
+    const map = new Map<string, Invoice>();
+    remote.forEach(inv => map.set(inv.id, inv));
+    local.forEach(inv => {
+      if (pendingIds.has(inv.id) || !map.has(inv.id)) {
+        map.set(inv.id, inv);
+      }
+    });
+    const sorted = Array.from(map.values()).sort((a, b) => new Date(b.date).getTime() - new Date(a.date).getTime());
+    this.setItem(STORAGE_KEYS.INVOICES, sorted);
+  }
+
+  mergeRemoteCustomers(remote: Customer[]): void {
+    if (!remote || remote.length === 0) return;
+    const local = this.getCustomers();
+    const queue = firebaseSync.getQueue();
+    const pendingIds = new Set(queue.filter(q => q.collection === 'customers').map(q => q.id));
+
+    const map = new Map<string, Customer>();
+    remote.forEach(c => map.set(c.id, c));
+    local.forEach(c => {
+      if (pendingIds.has(c.id) || !map.has(c.id)) {
+        map.set(c.id, c);
+      }
+    });
+    this.setItem(STORAGE_KEYS.CUSTOMERS, Array.from(map.values()));
+  }
+
+  mergeRemoteSuppliers(remote: Supplier[]): void {
+    if (!remote || remote.length === 0) return;
+    const local = this.getSuppliers();
+    const queue = firebaseSync.getQueue();
+    const pendingIds = new Set(queue.filter(q => q.collection === 'suppliers').map(q => q.id));
+
+    const map = new Map<string, Supplier>();
+    remote.forEach(s => map.set(s.id, s));
+    local.forEach(s => {
+      if (pendingIds.has(s.id) || !map.has(s.id)) {
+        map.set(s.id, s);
+      }
+    });
+    this.setItem(STORAGE_KEYS.SUPPLIERS, Array.from(map.values()));
+  }
+
+  mergeRemotePurchases(remote: Purchase[]): void {
+    if (!remote || remote.length === 0) return;
+    const local = this.getPurchases();
+    const queue = firebaseSync.getQueue();
+    const pendingIds = new Set(queue.filter(q => q.collection === 'purchases').map(q => q.id));
+
+    const map = new Map<string, Purchase>();
+    remote.forEach(p => map.set(p.id, p));
+    local.forEach(p => {
+      if (pendingIds.has(p.id) || !map.has(p.id)) {
+        map.set(p.id, p);
+      }
+    });
+    const sorted = Array.from(map.values()).sort((a, b) => new Date(b.date).getTime() - new Date(a.date).getTime());
+    this.setItem(STORAGE_KEYS.PURCHASES, sorted);
+  }
+
+  mergeRemoteVouchers(remote: Voucher[]): void {
+    if (!remote || remote.length === 0) return;
+    const local = this.getVouchers();
+    const queue = firebaseSync.getQueue();
+    const pendingIds = new Set(queue.filter(q => q.collection === 'vouchers').map(q => q.id));
+
+    const map = new Map<string, Voucher>();
+    remote.forEach(v => map.set(v.id, v));
+    local.forEach(v => {
+      if (pendingIds.has(v.id) || !map.has(v.id)) {
+        map.set(v.id, v);
+      }
+    });
+    const sorted = Array.from(map.values()).sort((a, b) => new Date(b.date).getTime() - new Date(a.date).getTime());
+    this.setItem(STORAGE_KEYS.VOUCHERS, sorted);
   }
 
   exportBackupJSON(): string { return this.exportAllDataJSON(); }

@@ -24,6 +24,8 @@ import { QuickStockAuditModal } from './components/QuickStockAuditModal';
 import { CustomerDisplayView } from './components/CustomerDisplayView';
 
 import { pharmacyStorage } from './services/storage';
+import { firebaseSync } from './services/firebaseSync';
+import { checkAndRunDailyBackup } from './services/googleDrive';
 import { 
   MainTab, 
   Product, 
@@ -136,6 +138,22 @@ export default function App() {
     setInvoices(pharmacyStorage.getInvoices());
     setVouchers(pharmacyStorage.getVouchers());
   }, []);
+
+  // Listen to Firestore real-time sync updates and check daily Google Drive backup
+  useEffect(() => {
+    const unsubscribeSync = firebaseSync.onStatusChange((status) => {
+      if (status === 'synced') {
+        refreshAllState();
+      }
+    });
+
+    // Check automated daily Google Drive backup
+    checkAndRunDailyBackup().catch((e) => console.log('Daily backup auto check:', e));
+
+    return () => {
+      unsubscribeSync();
+    };
+  }, [refreshAllState]);
 
   // Settings update
   const handleUpdateSettings = (newSettings: Settings) => {
@@ -550,6 +568,7 @@ export default function App() {
             onResetDatabase={handleResetDatabase}
             onGenerate5000Items={handleGenerate5000Items}
             totalProductsCount={products.length}
+            onRefreshData={refreshAllState}
           />
         )}
       </main>

@@ -25,10 +25,13 @@ import {
   QrCode,
   PackageCheck,
   Monitor,
-  Smartphone
+  Smartphone,
+  Cloud,
+  CloudOff
 } from 'lucide-react';
 import { MainTab, Settings } from '../types/pharmacy';
 import { PWAInstallButton } from './PWAInstallButton';
+import { firebaseSync, SyncStatus } from '../services/firebaseSync';
 
 interface NavbarProps {
   activeTab: MainTab;
@@ -62,6 +65,15 @@ export const Navbar: React.FC<NavbarProps> = ({
   cartCount,
 }) => {
   const [isMobileMenuOpen, setIsMobileMenuOpen] = useState(false);
+  const [syncStatus, setSyncStatus] = useState<SyncStatus>('synced');
+  const [pendingSyncCount, setPendingSyncCount] = useState(0);
+
+  React.useEffect(() => {
+    return firebaseSync.onStatusChange((status, count) => {
+      setSyncStatus(status);
+      setPendingSyncCount(count);
+    });
+  }, []);
 
   const allNavItems: { id: MainTab; label: string; icon: React.ReactNode; badge?: number; category: string }[] = [
     { id: 'pos', label: 'الكاشير (POS)', icon: <ShoppingCart className="h-4 w-4" />, badge: cartCount, category: 'المبيعات والكاشير' },
@@ -221,10 +233,41 @@ export const Navbar: React.FC<NavbarProps> = ({
             {/* PWA Install Button */}
             <PWAInstallButton />
 
+            {/* Live Cloud / Firebase Sync Status Pill */}
+            <button
+              onClick={() => handleTabClick('settings')}
+              className={`flex items-center gap-1.5 min-h-[38px] px-2.5 sm:px-3 py-1.5 rounded-xl text-xs font-bold transition-all ${
+                syncStatus === 'synced'
+                  ? 'bg-emerald-50 text-emerald-700 hover:bg-emerald-100 dark:bg-emerald-950 dark:text-emerald-300'
+                  : syncStatus === 'syncing'
+                  ? 'bg-sky-50 text-sky-700 hover:bg-sky-100 dark:bg-sky-950 dark:text-sky-300 animate-pulse'
+                  : 'bg-amber-50 text-amber-800 hover:bg-amber-100 dark:bg-amber-950 dark:text-amber-300'
+              }`}
+              title={
+                syncStatus === 'synced'
+                  ? 'قاعدة البيانات متصلة ومتزامنة مع فايربيس (انقر للإعدادات)'
+                  : syncStatus === 'syncing'
+                  ? 'جاري رفع ومزامنة العمليات مع فايربيس...'
+                  : `وضع عدم الاتصال بالإنترنت - يتم الحفظ محلياً (${pendingSyncCount} معلقة)`
+              }
+            >
+              {syncStatus === 'synced' && <Cloud className="h-4 w-4 text-emerald-600" />}
+              {syncStatus === 'syncing' && <Cloud className="h-4 w-4 text-sky-600 animate-bounce" />}
+              {syncStatus === 'offline' && <CloudOff className="h-4 w-4 text-amber-600" />}
+              {syncStatus === 'error' && <CloudOff className="h-4 w-4 text-rose-600" />}
+              
+              <span className="hidden sm:inline">
+                {syncStatus === 'synced' && 'متزامن 🟢'}
+                {syncStatus === 'syncing' && 'جاري الرفع 🔄'}
+                {syncStatus === 'offline' && `محلي (${pendingSyncCount})`}
+                {syncStatus === 'error' && 'معلق'}
+              </span>
+            </button>
+
             {/* Quick Backup (hidden on small phone, available in More menu) */}
             <button
               onClick={onQuickBackup}
-              className="hidden lg:flex items-center gap-1 min-h-[38px] rounded-xl bg-emerald-50 px-3 py-1.5 text-xs font-bold text-emerald-700 hover:bg-emerald-100 dark:bg-emerald-950 dark:text-emerald-300 transition-colors"
+              className="hidden lg:flex items-center gap-1 min-h-[38px] rounded-xl bg-teal-50 px-3 py-1.5 text-xs font-bold text-teal-700 hover:bg-teal-100 dark:bg-teal-950 dark:text-teal-300 transition-colors"
               title="تصدير نسخة احتياطية فورية JSON"
             >
               <Download className="h-4 w-4" />

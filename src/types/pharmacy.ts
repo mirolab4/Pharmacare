@@ -19,6 +19,10 @@ export interface Settings {
   receiptFooter?: string;
   thermalPaperWidth?: '58mm' | '80mm';
   googleDriveBackupEnabled?: boolean;
+  autoDailyDriveBackup?: boolean;
+  lastDriveBackupTime?: string;
+  lastDriveBackupFileName?: string;
+  lastDriveBackupStatus?: 'success' | 'failed' | 'pending';
   lastCloudSync?: string;
   customerDisplayEnabled?: boolean;
   themeColor?: 'sky' | 'emerald' | 'indigo' | 'purple' | 'amber' | 'rose' | 'slate';
