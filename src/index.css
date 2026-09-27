@@ -1,0 +1,26 @@
+@import "tailwindcss";
+
+@layer base {
+  html, body {
+    max-width: 100%;
+    overflow-x: hidden;
+    -webkit-overflow-scrolling: touch;
+    touch-action: manipulation;
+  }
+
+  /* Safe area helpers for modern mobile devices (iPhone notch/pill) */
+  :root {
+    --safe-bottom: env(safe-area-inset-bottom, 0px);
+    --safe-top: env(safe-area-inset-top, 0px);
+  }
+}
+
+/* Touch-friendly scrollbars */
+.scrollbar-thin::-webkit-scrollbar {
+  height: 4px;
+  width: 4px;
+}
+.scrollbar-thin::-webkit-scrollbar-thumb {
+  background: rgba(148, 163, 184, 0.4);
+  border-radius: 9999px;
+}

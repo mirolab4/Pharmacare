@@ -1,0 +1,41 @@
+{
+  "id": "./",
+  "name": "فارماكير بلس - إدارة ونقاط بيع الصيدليات",
+  "short_name": "فارماكير",
+  "description": "نظام محاسبة ونقاط بيع وإدارة صيدلية متكامل، يعمل بدون إنترنت (Offline-First) مع ماسح باركود ذكي وإدارة أدوية ومبيعات وطباعة إيصالات حرارية.",
+  "start_url": "./",
+  "scope": "./",
+  "display": "standalone",
+  "orientation": "portrait-primary",
+  "background_color": "#0f172a",
+  "theme_color": "#0284c7",
+  "lang": "ar",
+  "dir": "rtl",
+  "categories": ["medical", "business", "productivity"],
+  "icons": [
+    {
+      "src": "pwa-192x192.png",
+      "sizes": "192x192",
+      "type": "image/png",
+      "purpose": "any"
+    },
+    {
+      "src": "pwa-512x512.png",
+      "sizes": "512x512",
+      "type": "image/png",
+      "purpose": "any"
+    },
+    {
+      "src": "pwa-maskable-512x512.png",
+      "sizes": "512x512",
+      "type": "image/png",
+      "purpose": "maskable"
+    },
+    {
+      "src": "icon.svg",
+      "sizes": "512x512",
+      "type": "image/svg+xml",
+      "purpose": "any"
+    }
+  ]
+}

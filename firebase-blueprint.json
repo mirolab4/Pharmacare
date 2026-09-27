@@ -1,0 +1,169 @@
+{
+  "entities": {
+    "Product": {
+      "title": "Product",
+      "description": "Pharmacy medicine or commercial product item with smart unit hierarchy",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string", "maxLength": 128 },
+        "nameAr": { "type": "string", "maxLength": 200 },
+        "nameEn": { "type": "string", "maxLength": 200 },
+        "barcode": { "type": "string", "maxLength": 100 },
+        "type": { "type": "string", "enum": ["medicine", "commercial"] },
+        "categoryId": { "type": "string", "maxLength": 100 },
+        "manufacturerId": { "type": "string", "maxLength": 100 },
+        "stock": { "type": "number" },
+        "lastCostPrice": { "type": "number" },
+        "lastSalePrice": { "type": "number" },
+        "createdAt": { "type": "string", "format": "date-time" },
+        "updatedAt": { "type": "string", "format": "date-time" }
+      },
+      "required": ["id", "nameAr", "barcode", "type", "stock"]
+    },
+    "Customer": {
+      "title": "Customer",
+      "description": "Pharmacy customer with credit balance and credit limit",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string", "maxLength": 128 },
+        "name": { "type": "string", "maxLength": 150 },
+        "phone": { "type": "string", "maxLength": 50 },
+        "address": { "type": "string", "maxLength": 250 },
+        "balance": { "type": "number" },
+        "creditLimit": { "type": "number" },
+        "maxDebtDays": { "type": "number" },
+        "createdAt": { "type": "string", "format": "date-time" }
+      },
+      "required": ["id", "name", "phone", "balance"]
+    },
+    "Supplier": {
+      "title": "Supplier",
+      "description": "Pharmaceutical warehouse or medicine distributor",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string", "maxLength": 128 },
+        "name": { "type": "string", "maxLength": 150 },
+        "phone": { "type": "string", "maxLength": 50 },
+        "address": { "type": "string", "maxLength": 250 },
+        "company": { "type": "string", "maxLength": 150 },
+        "balance": { "type": "number" },
+        "createdAt": { "type": "string", "format": "date-time" }
+      },
+      "required": ["id", "name", "phone", "balance"]
+    },
+    "Invoice": {
+      "title": "Invoice",
+      "description": "Point of sale retail sale or return invoice",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string", "maxLength": 128 },
+        "invoiceNumber": { "type": "string", "maxLength": 100 },
+        "date": { "type": "string", "format": "date-time" },
+        "type": { "type": "string", "enum": ["sale", "sale_return"] },
+        "totalAmount": { "type": "number" },
+        "paidAmount": { "type": "number" },
+        "remainingAmount": { "type": "number" },
+        "paymentMethod": { "type": "string", "enum": ["cash", "bank", "credit"] },
+        "status": { "type": "string", "enum": ["active", "cancelled"] },
+        "createdAt": { "type": "string", "format": "date-time" }
+      },
+      "required": ["id", "invoiceNumber", "date", "totalAmount", "paidAmount", "remainingAmount", "paymentMethod"]
+    },
+    "Purchase": {
+      "title": "Purchase",
+      "description": "Inventory purchase or purchase return transaction",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string", "maxLength": 128 },
+        "purchaseNumber": { "type": "string", "maxLength": 100 },
+        "date": { "type": "string", "format": "date-time" },
+        "type": { "type": "string", "enum": ["purchase", "purchase_return"] },
+        "partyId": { "type": "string", "maxLength": 128 },
+        "partyName": { "type": "string", "maxLength": 150 },
+        "totalAmount": { "type": "number" },
+        "paidAmount": { "type": "number" },
+        "remainingAmount": { "type": "number" },
+        "status": { "type": "string", "enum": ["active", "cancelled"] },
+        "createdAt": { "type": "string", "format": "date-time" }
+      },
+      "required": ["id", "purchaseNumber", "date", "totalAmount"]
+    },
+    "Voucher": {
+      "title": "Voucher",
+      "description": "Financial payment or receipt voucher",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string", "maxLength": 128 },
+        "voucherNumber": { "type": "string", "maxLength": 100 },
+        "date": { "type": "string", "format": "date-time" },
+        "type": { "type": "string", "enum": ["receipt", "payment", "journal"] },
+        "amount": { "type": "number" },
+        "paymentMethod": { "type": "string", "enum": ["cash", "bank"] },
+        "createdAt": { "type": "string", "format": "date-time" }
+      },
+      "required": ["id", "voucherNumber", "date", "type", "amount", "paymentMethod"]
+    },
+    "StockMovement": {
+      "title": "StockMovement",
+      "description": "Ledger movement of stock in or out",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string", "maxLength": 128 },
+        "productId": { "type": "string", "maxLength": 128 },
+        "productName": { "type": "string", "maxLength": 200 },
+        "date": { "type": "string", "format": "date-time" },
+        "type": { "type": "string", "enum": ["sale", "purchase", "return", "adjustment", "cancellation"] },
+        "quantity": { "type": "number" },
+        "balanceAfter": { "type": "number" }
+      },
+      "required": ["id", "productId", "date", "type", "quantity"]
+    },
+    "Settings": {
+      "title": "Settings",
+      "description": "Pharmacy system configuration and preferences",
+      "type": "object",
+      "properties": {
+        "pharmacyName": { "type": "string", "maxLength": 150 },
+        "phone": { "type": "string", "maxLength": 80 },
+        "address": { "type": "string", "maxLength": 250 },
+        "taxNumber": { "type": "string", "maxLength": 50 },
+        "currency": { "type": "string", "maxLength": 10 }
+      },
+      "required": ["pharmacyName", "currency"]
+    }
+  },
+  "firestore": {
+    "/products/{productId}": {
+      "schema": "Product",
+      "description": "Pharmacy products and medicine catalog"
+    },
+    "/customers/{customerId}": {
+      "schema": "Customer",
+      "description": "Pharmacy customers and debt accounts"
+    },
+    "/suppliers/{supplierId}": {
+      "schema": "Supplier",
+      "description": "Medicine suppliers and distributors"
+    },
+    "/invoices/{invoiceId}": {
+      "schema": "Invoice",
+      "description": "Point of sale invoices"
+    },
+    "/purchases/{purchaseId}": {
+      "schema": "Purchase",
+      "description": "Purchase invoices and returns"
+    },
+    "/vouchers/{voucherId}": {
+      "schema": "Voucher",
+      "description": "Receipt and payment vouchers"
+    },
+    "/stockMovements/{movementId}": {
+      "schema": "StockMovement",
+      "description": "Inventory stock movement audit log"
+    },
+    "/settings/{settingsId}": {
+      "schema": "Settings",
+      "description": "Pharmacy system settings"
+    }
+  }
+}

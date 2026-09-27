@@ -1,0 +1,10 @@
+{
+  "name": "Remix فارماكير بلس - نظام إدارة ونقاط بيع الصيدليات",
+  "description": "نظام محاسبة ونقاط بيع (POS) وإدارة صيدلية متكامل، يعمل بدون إنترنت (Offline-First) مع ماسح باركود ذكي وإدارة أدوية وبدائل وطباعة إيصالات حرارية.",
+  "requestFramePermissions": [
+    "camera"
+  ],
+  "majorCapabilities": [
+    "MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"
+  ]
+}
