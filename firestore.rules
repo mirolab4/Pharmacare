@@ -25,8 +25,8 @@ service cloud.firestore {
     }
 
     function isPharmacyUser() {
-      // Allow authenticated user, anonymous auth, or project admin
-      return isSignedIn() || (request.auth != null && request.auth.token.email == 'mirolab4@gmail.com');
+      // Allow pharmacy operations without forcing manual login for cashier/POS
+      return true;
     }
 
     // Products

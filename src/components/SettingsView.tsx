@@ -36,7 +36,9 @@ import {
   DriveBackupFile,
   initDriveAuth,
   DriveAuthState,
-  getDriveAccessToken
+  getDriveAccessToken,
+  shareBackupToDriveDirectly,
+  canShareBackupDirectly
 } from '../services/googleDrive';
 
 interface SettingsViewProps {
@@ -91,6 +93,9 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
   const [loadingDriveBackups, setLoadingDriveBackups] = useState(false);
   const [driveOperationLoading, setDriveOperationLoading] = useState(false);
   const [driveStatusMessage, setDriveStatusMessage] = useState<{ text: string; type: 'success' | 'error' } | null>(null);
+  const [unauthorizedDomain, setUnauthorizedDomain] = useState<string | null>(null);
+  const [isDirectSharing, setIsDirectSharing] = useState(false);
+  const [directShareSuccess, setDirectShareSuccess] = useState(false);
 
   // Confirmation Modals for Destructive Drive Operations (per guidelines)
   const [restoreConfirmFile, setRestoreConfirmFile] = useState<DriveBackupFile | null>(null);
@@ -180,6 +185,7 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
   const handleConnectGoogleDrive = async () => {
     setIsSigningInDrive(true);
     setDriveStatusMessage(null);
+    setUnauthorizedDomain(null);
     try {
       const res = await signInWithGoogleDrive();
       setDriveStatusMessage({
@@ -188,10 +194,20 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
       });
       await fetchDriveBackupsList();
     } catch (err: any) {
-      setDriveStatusMessage({
-        text: `فشل تسجيل الدخول إلى Google Drive: ${err?.message || 'خطأ غير معروف'}`,
-        type: 'error',
-      });
+      const msg = err?.message || 'خطأ غير معروف';
+      if (msg.includes('auth/unauthorized-domain')) {
+        const domain = typeof window !== 'undefined' ? window.location.hostname : 'mirolab4.github.io';
+        setUnauthorizedDomain(domain);
+        setDriveStatusMessage({
+          text: `النطاق (${domain}) يحتاج لإضافته في قائمة النطاقات المصرح بها في Firebase Console للربط عبر الـ API. راجع الخطوات البسيطة أدناه، أو استخدم زر "حفظ في تطبيق Drive" المباشر.`,
+          type: 'error',
+        });
+      } else {
+        setDriveStatusMessage({
+          text: `فشل تسجيل الدخول إلى Google Drive: ${msg}`,
+          type: 'error',
+        });
+      }
     } finally {
       setIsSigningInDrive(false);
     }
@@ -207,22 +223,51 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
     }
   };
 
-  // Instant Drive Backup
+  // Direct share to Google Drive on phone/desktop without requiring OAuth setup
+  const handleDirectShareBackup = async () => {
+    setIsDirectSharing(true);
+    try {
+      const ok = await shareBackupToDriveDirectly();
+      if (ok) {
+        setDirectShareSuccess(true);
+        setTimeout(() => setDirectShareSuccess(false), 5000);
+      }
+    } catch (err: any) {
+      if (err.name !== 'AbortError') {
+        alert('تعذر فتح نافذة المشاركة. يمكنك تصدير الملف واستيراده يدوياً.');
+      }
+    } finally {
+      setIsDirectSharing(false);
+    }
+  };
+
+  // Instant Drive Backup via API
   const handleCreateDriveBackup = async () => {
     setDriveOperationLoading(true);
     setDriveStatusMessage(null);
+    setUnauthorizedDomain(null);
     try {
       const uploadedFile = await uploadBackupToDrive(false);
       setDriveStatusMessage({
-        text: `تم حفظ ورفع النسخة الاحتياطية بنجاح إلى مجلد PharmaCare_Backups (${uploadedFile.name})`,
+        text: `تم رفع النسخة الاحتياطية بنجاح إلى مجلد PharmaCare_Backups على حساب Google Drive (${uploadedFile.name})`,
         type: 'success',
       });
       await fetchDriveBackupsList();
     } catch (err: any) {
-      setDriveStatusMessage({
-        text: `فشل رفع النسخة إلى Google Drive: ${err?.message || 'خطأ غير معروف'}`,
-        type: 'error',
-      });
+      const msg = err?.message || 'خطأ غير معروف';
+      if (msg.includes('auth/unauthorized-domain')) {
+        const domain = typeof window !== 'undefined' ? window.location.hostname : 'mirolab4.github.io';
+        setUnauthorizedDomain(domain);
+        setDriveStatusMessage({
+          text: `النطاق (${domain}) غير مصرح به في Firebase Console. راجع الخطوات أدناه أو احفظ عبر تطبيق Drive المباشر.`,
+          type: 'error',
+        });
+      } else {
+        setDriveStatusMessage({
+          text: `فشل رفع النسخة إلى Google Drive: ${msg}`,
+          type: 'error',
+        });
+      }
     } finally {
       setDriveOperationLoading(false);
     }
@@ -399,17 +444,52 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
             </div>
             <div>
               <h3 className="font-extrabold text-sm sm:text-base text-slate-900 dark:text-white">
-                النسخ الاحتياطي اليومي إلى Google Drive (Daily Backup)
+                النسخ الاحتياطي إلى Google Drive (Daily Backup)
               </h3>
               <p className="text-xs text-slate-500 dark:text-slate-400">
-                حفظ نسخة احتياطية يومية كاملة وتلقائية في مجلد PharmaCare_Backups على Google Drive.
+                حفظ نسخة احتياطية كاملة وتلقائية في Google Drive لحماية كافة بيانات ومبيعات الصيدلية.
               </p>
             </div>
           </div>
         </div>
 
-        {/* Google Drive Account Connection Banner */}
-        <div className="p-4 rounded-xl bg-slate-50 dark:bg-slate-800 border border-slate-200 dark:border-slate-700">
+        {/* Option A: Direct Mobile & Desktop Save to Google Drive without OAuth */}
+        <div className="p-4 rounded-xl bg-emerald-50/80 dark:bg-emerald-950/40 border border-emerald-300 dark:border-emerald-800 flex flex-col sm:flex-row items-start sm:items-center justify-between gap-3">
+          <div className="space-y-1">
+            <span className="font-bold text-xs text-emerald-950 dark:text-emerald-200 flex items-center gap-1.5">
+              <CloudUpload className="h-4 w-4 text-emerald-600 shrink-0" />
+              <span>طريقة 1: حفظ ومشاركة مباشرة في تطبيق Google Drive 📱 (تعمل فوراً دون تسجيل دخول)</span>
+            </span>
+            <p className="text-[11px] text-slate-600 dark:text-slate-300">
+              تفتح نافذة المشاركة على هاتفك أو حاسوبك لاختيار تطبيق Google Drive وتحديد المجلد الذي تريده مباشرة.
+            </p>
+          </div>
+
+          <button
+            type="button"
+            onClick={handleDirectShareBackup}
+            disabled={isDirectSharing}
+            className="w-full sm:w-auto shrink-0 flex items-center justify-center gap-2 rounded-xl bg-emerald-600 px-4 py-2.5 text-xs font-extrabold text-white shadow-xs hover:bg-emerald-700 active:scale-95 transition-all"
+          >
+            <CloudUpload className="h-4 w-4" />
+            <span>{isDirectSharing ? 'جاري الفتح...' : 'حفظ في تطبيق Google Drive 📱'}</span>
+          </button>
+        </div>
+
+        {directShareSuccess && (
+          <div className="p-3 rounded-xl bg-emerald-100 text-emerald-900 border border-emerald-300 text-xs font-bold flex items-center gap-2">
+            <CheckCircle2 className="h-4 w-4 text-emerald-600" />
+            <span>تم فتح نافذة المشاركة وحفظ الملف بنجاح في Google Drive!</span>
+          </div>
+        )}
+
+        {/* Option B: Automatic Cloud API Sync with Google Drive */}
+        <div className="p-4 rounded-xl bg-slate-50 dark:bg-slate-800 border border-slate-200 dark:border-slate-700 space-y-3">
+          <div className="font-bold text-xs text-slate-900 dark:text-white flex items-center gap-1.5">
+            <HardDrive className="h-4 w-4 text-sky-600" />
+            <span>طريقة 2: المزامنة السحابية المباشرة مع Google Drive API (النسخ التلقائي كل 24 ساعة)</span>
+          </div>
+
           {driveAuth.hasDriveAccess && driveAuth.user ? (
             <div className="flex flex-col sm:flex-row items-start sm:items-center justify-between gap-3">
               <div className="flex items-center gap-3">
@@ -455,7 +535,7 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
                   ربط Google Drive بالصيدلية
                 </span>
                 <p className="text-[11px] text-slate-500">
-                  قم بتسجيل الدخول بحساب Google لتمكين حفظ النسخ الاحتياطية اليومية لبيانات الصيدلية تلقائياً بأمان تام.
+                  قم بتسجيل الدخول بحساب Google لتمكين حفظ النسخ الاحتياطية اليومية لبيانات الصيدلية تلقائياً في مجلد PharmaCare_Backups.
                 </p>
               </div>
 
@@ -477,6 +557,28 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
             </div>
           )}
         </div>
+
+        {/* Detailed Guided Box for auth/unauthorized-domain if encountered */}
+        {unauthorizedDomain && (
+          <div className="p-4 rounded-xl bg-amber-50 dark:bg-amber-950/70 border border-amber-300 dark:border-amber-800 text-xs text-amber-900 dark:text-amber-200 space-y-2.5">
+            <div className="flex items-center gap-2 font-bold text-amber-800 dark:text-amber-300">
+              <AlertTriangle className="h-5 w-5 text-amber-600 shrink-0" />
+              <span>خطوة بسيطة لإتاحة تسجيل الدخول بـ Google على GitHub Pages ({unauthorizedDomain}):</span>
+            </div>
+            <p className="leading-relaxed">
+              لأنك رفعت موقعك على رابط GitHub Pages (<strong className="font-mono bg-white dark:bg-slate-800 px-1.5 py-0.5 rounded border border-amber-300" dir="ltr">{unauthorizedDomain}</strong>)، تشترط Google أمنياً إضافة هذا الرابط في قائمة النطاقات المصرح بها في مشروع Firebase:
+            </p>
+            <div className="bg-white/80 dark:bg-slate-900/80 p-3 rounded-lg border border-amber-200 dark:border-amber-900 space-y-1.5 font-sans">
+              <p>1. افتح لوحة تحكم فايربيس: <a href="https://console.firebase.google.com" target="_blank" rel="noreferrer" className="underline font-bold text-sky-600">console.firebase.google.com</a></p>
+              <p>2. اختر مشروعك ثم اضغط على <strong>Authentication (المصادقة)</strong> من القائمة الجانبية.</p>
+              <p>3. افتح تبويب <strong>Settings (الإعدادات)</strong> ثم اختر <strong>Authorized domains (النطاقات المصرح بها)</strong>.</p>
+              <p>4. اضغط <strong>Add domain (إضافة نطاق)</strong> واكتب: <code className="font-mono font-bold text-emerald-700 bg-emerald-50 px-2 py-0.5 rounded select-all">{unauthorizedDomain}</code> ثم اضغط حفظ.</p>
+            </div>
+            <p className="text-[11px] text-slate-500 dark:text-slate-400">
+              💡 <em>ملاحظة: يمكنك في أي وقت استخدام زر "طريقة 1: حفظ ومشاركة مباشرة في تطبيق Google Drive" بالأعلى لحفظ النسخة على هاتفك فوراً دون الحاجة لأي إعدادات!</em>
+            </p>
+          </div>
+        )}
 
         {/* Auto Backup Toggle & Frequency */}
         <div className="grid grid-cols-1 sm:grid-cols-2 gap-4 text-xs">
@@ -514,7 +616,7 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
           </div>
         </div>
 
-        {driveStatusMessage && (
+        {driveStatusMessage && !unauthorizedDomain && (
           <div className={`p-3 rounded-xl text-xs font-bold flex items-center gap-2 ${
             driveStatusMessage.type === 'success'
               ? 'bg-emerald-50 text-emerald-800 border border-emerald-300 dark:bg-emerald-950/60 dark:border-emerald-800 dark:text-emerald-200'
@@ -538,7 +640,7 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
             className="flex items-center justify-center gap-2 rounded-xl bg-emerald-600 px-5 py-2.5 text-xs font-extrabold text-white shadow-xs hover:bg-emerald-700 active:scale-95 transition-all"
           >
             <CloudUpload className={`h-4 w-4 ${driveOperationLoading ? 'animate-bounce' : ''}`} />
-            <span>{driveOperationLoading ? 'جاري الرفع إلى Drive...' : 'رفع نسخة احتياطية فورية إلى Google Drive 🚀'}</span>
+            <span>{driveOperationLoading ? 'جاري الرفع إلى Drive...' : 'رفع سحابي فوري إلى مجلد Drive (API) 🚀'}</span>
           </button>
 
           {driveAuth.hasDriveAccess && (

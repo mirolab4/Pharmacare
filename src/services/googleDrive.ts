@@ -308,9 +308,41 @@ export async function deleteDriveBackupFile(fileId: string): Promise<boolean> {
 }
 
 /**
- * Daily backup scheduler check
- * Checks if today's backup has run, and if not, runs it silently if token exists
+ * Check if the browser supports sharing files directly to Google Drive / Share Sheet
  */
+export function canShareBackupDirectly(): boolean {
+  if (typeof navigator === 'undefined' || !navigator.share) return false;
+  try {
+    const dummyFile = new File(['{}'], 'test.json', { type: 'application/json' });
+    return !!(navigator.canShare && navigator.canShare({ files: [dummyFile] }));
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Share backup file directly to Google Drive / system share sheet (Zero setup, works on Android & iOS & desktop)
+ */
+export async function shareBackupToDriveDirectly(): Promise<boolean> {
+  const backupJson = pharmacyStorage.exportAllDataJSON();
+  const now = new Date();
+  const dateFormatted = now.toISOString().split('T')[0];
+  const timeFormatted = now.toTimeString().split(' ')[0].replace(/:/g, '-');
+  const fileName = `pharmacare_backup_${dateFormatted}_${timeFormatted}.json`;
+
+  const file = new File([backupJson], fileName, { type: 'application/json' });
+
+  if (navigator.share) {
+    await navigator.share({
+      title: 'نسخة احتياطية لنظام فارماكير بلس',
+      text: 'حفظ النسخة الاحتياطية لقاعدة بيانات الصيدلية مباشرة إلى Google Drive',
+      files: [file],
+    });
+    return true;
+  }
+  return false;
+}
+
 export async function checkAndRunDailyBackup(): Promise<boolean> {
   const settings = pharmacyStorage.getSettings();
   if (settings.autoDailyDriveBackup === false) {
