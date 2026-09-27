@@ -10,10 +10,48 @@ import { pharmacyStorage } from './storage';
 const SCOPES = ['https://www.googleapis.com/auth/drive.file'];
 const BACKUP_FOLDER_NAME = 'PharmaCare_Backups';
 const LAST_BACKUP_DATE_KEY = 'pharmacare_last_drive_backup_date';
+const TOKEN_KEY = 'pharmacare_drive_access_token';
+const TOKEN_EXPIRY_KEY = 'pharmacare_drive_token_expiry';
+const USER_EMAIL_KEY = 'pharmacare_drive_user_email';
 
-// In-memory token cache (Do NOT store in localStorage per guidelines)
+// Token caching with session & local storage fallback so page refreshes don't lose connection
 let cachedAccessToken: string | null = null;
 let isSigningIn = false;
+
+export function getDriveAccessToken(): string | null {
+  if (cachedAccessToken) return cachedAccessToken;
+  try {
+    const saved = localStorage.getItem(TOKEN_KEY) || sessionStorage.getItem(TOKEN_KEY);
+    const expiry = localStorage.getItem(TOKEN_EXPIRY_KEY) || sessionStorage.getItem(TOKEN_EXPIRY_KEY);
+    if (saved && expiry && Date.now() < parseInt(expiry, 10)) {
+      cachedAccessToken = saved;
+      return saved;
+    }
+  } catch (e) {}
+  return null;
+}
+
+export function setStoredAccessToken(token: string, expiresInSeconds: number = 3600) {
+  cachedAccessToken = token;
+  const expiry = Date.now() + (expiresInSeconds - 120) * 1000;
+  try {
+    localStorage.setItem(TOKEN_KEY, token);
+    localStorage.setItem(TOKEN_EXPIRY_KEY, expiry.toString());
+    sessionStorage.setItem(TOKEN_KEY, token);
+    sessionStorage.setItem(TOKEN_EXPIRY_KEY, expiry.toString());
+  } catch (e) {}
+}
+
+export function clearStoredAccessToken() {
+  cachedAccessToken = null;
+  try {
+    localStorage.removeItem(TOKEN_KEY);
+    localStorage.removeItem(TOKEN_EXPIRY_KEY);
+    localStorage.removeItem(USER_EMAIL_KEY);
+    sessionStorage.removeItem(TOKEN_KEY);
+    sessionStorage.removeItem(TOKEN_EXPIRY_KEY);
+  } catch (e) {}
+}
 
 export interface DriveBackupFile {
   id: string;
@@ -36,11 +74,20 @@ const authListeners: AuthListener[] = [];
 export function initDriveAuth(listener: AuthListener): () => void {
   authListeners.push(listener);
   
+  // Emit initial state immediately
+  const token = getDriveAccessToken();
+  listener({
+    isAuthenticated: !!auth.currentUser,
+    user: auth.currentUser,
+    hasDriveAccess: !!token,
+  });
+
   const unsubscribe = onAuthStateChanged(auth, (user) => {
+    const currentToken = getDriveAccessToken();
     const state: DriveAuthState = {
       isAuthenticated: !!user,
       user,
-      hasDriveAccess: !!cachedAccessToken,
+      hasDriveAccess: !!currentToken,
     };
     listener(state);
   });
@@ -53,10 +100,11 @@ export function initDriveAuth(listener: AuthListener): () => void {
 }
 
 function notifyAuthListeners(user: User | null) {
+  const currentToken = getDriveAccessToken();
   const state: DriveAuthState = {
     isAuthenticated: !!user,
     user,
-    hasDriveAccess: !!cachedAccessToken,
+    hasDriveAccess: !!currentToken,
   };
   authListeners.forEach((l) => l(state));
 }
@@ -70,21 +118,39 @@ export async function signInWithGoogleDrive(): Promise<{ user: User; accessToken
     const provider = new GoogleAuthProvider();
     SCOPES.forEach((scope) => provider.addScope(scope));
     provider.setCustomParameters({
-      prompt: 'consent',
-      access_type: 'offline',
+      prompt: 'select_account',
     });
 
-    const result = await signInWithPopup(auth, provider);
+    let result;
+    try {
+      result = await signInWithPopup(auth, provider);
+    } catch (popupErr: any) {
+      if (popupErr?.code === 'auth/cancelled-popup-request' || popupErr?.code === 'auth/popup-closed-by-user') {
+        throw popupErr;
+      }
+      // If error occurred with stale session, sign out cleanly and retry once
+      await signOut(auth);
+      clearStoredAccessToken();
+      result = await signInWithPopup(auth, provider);
+    }
+
     const credential = GoogleAuthProvider.credentialFromResult(result);
+    const token = credential?.accessToken;
     
-    if (!credential?.accessToken) {
+    if (!token) {
       throw new Error('لم نتمكن من الحصول على تصريح الوصول إلى Google Drive من المصادقة');
     }
 
-    cachedAccessToken = credential.accessToken;
+    setStoredAccessToken(token);
+    try {
+      if (result.user?.email) {
+        localStorage.setItem(USER_EMAIL_KEY, result.user.email);
+      }
+    } catch {}
+    
     notifyAuthListeners(result.user);
     
-    return { user: result.user, accessToken: cachedAccessToken };
+    return { user: result.user, accessToken: token };
   } catch (err) {
     console.error('Sign-in error with Google Drive scope:', err);
     throw err;
@@ -94,17 +160,10 @@ export async function signInWithGoogleDrive(): Promise<{ user: User; accessToken
 }
 
 /**
- * Get current Drive access token or return null
- */
-export function getDriveAccessToken(): string | null {
-  return cachedAccessToken;
-}
-
-/**
  * Sign out from Google Drive
  */
 export async function signOutFromDrive(): Promise<void> {
-  cachedAccessToken = null;
+  clearStoredAccessToken();
   await signOut(auth);
   notifyAuthListeners(null);
 }
@@ -156,7 +215,7 @@ async function getOrCreateBackupsFolder(token: string): Promise<string> {
  * Perform backup to Google Drive
  */
 export async function uploadBackupToDrive(isAutomatic = false): Promise<DriveBackupFile> {
-  let token = cachedAccessToken;
+  let token = getDriveAccessToken();
   if (!token) {
     // If not in memory and user triggers manual, prompt login
     if (!isAutomatic) {
@@ -206,6 +265,12 @@ export async function uploadBackupToDrive(isAutomatic = false): Promise<DriveBac
     body: multipartRequestBody,
   });
 
+  if (uploadRes.status === 401) {
+    clearStoredAccessToken();
+    notifyAuthListeners(auth.currentUser);
+    throw new Error('انتهت صلاحية جلسة Google Drive، يرجى النقر على زر تسجيل الدخول لتجديد الاتصال');
+  }
+
   if (!uploadRes.ok) {
     const errText = await uploadRes.text();
     throw new Error(`فشل رفع ملف النسخة الاحتياطية إلى Google Drive: ${errText}`);
@@ -235,7 +300,7 @@ export async function uploadBackupToDrive(isAutomatic = false): Promise<DriveBac
  * List existing backups from Google Drive
  */
 export async function listDriveBackups(): Promise<DriveBackupFile[]> {
-  const token = cachedAccessToken;
+  const token = getDriveAccessToken();
   if (!token) return [];
 
   try {
@@ -244,6 +309,12 @@ export async function listDriveBackups(): Promise<DriveBackupFile[]> {
     const res = await fetch(`https://www.googleapis.com/drive/v3/files?q=${query}&orderBy=createdTime desc&pageSize=20&fields=files(id,name,size,createdTime,description)`, {
       headers: { Authorization: `Bearer ${token}` },
     });
+
+    if (res.status === 401) {
+      clearStoredAccessToken();
+      notifyAuthListeners(auth.currentUser);
+      return [];
+    }
 
     if (!res.ok) {
       console.warn('Failed to list drive files:', await res.text());
@@ -268,7 +339,7 @@ export async function listDriveBackups(): Promise<DriveBackupFile[]> {
  * Download and restore backup content from Google Drive
  */
 export async function downloadAndRestoreBackup(fileId: string): Promise<boolean> {
-  const token = cachedAccessToken;
+  const token = getDriveAccessToken();
   if (!token) {
     throw new Error('غير مصرح بالوصول إلى Google Drive');
   }
@@ -276,6 +347,12 @@ export async function downloadAndRestoreBackup(fileId: string): Promise<boolean>
   const res = await fetch(`https://www.googleapis.com/drive/v3/files/${fileId}?alt=media`, {
     headers: { Authorization: `Bearer ${token}` },
   });
+
+  if (res.status === 401) {
+    clearStoredAccessToken();
+    notifyAuthListeners(auth.currentUser);
+    throw new Error('انتهت صلاحية جلسة Google Drive، يرجى تسجيل الدخول مجدداً');
+  }
 
   if (!res.ok) {
     throw new Error(`فشل تحميل النسخة الاحتياطية من درايف: ${res.statusText}`);
@@ -294,7 +371,7 @@ export async function downloadAndRestoreBackup(fileId: string): Promise<boolean>
  * Delete a backup file from Google Drive
  */
 export async function deleteDriveBackupFile(fileId: string): Promise<boolean> {
-  const token = cachedAccessToken;
+  const token = getDriveAccessToken();
   if (!token) {
     throw new Error('غير مصرح بالوصول إلى Google Drive');
   }
@@ -303,6 +380,12 @@ export async function deleteDriveBackupFile(fileId: string): Promise<boolean> {
     method: 'DELETE',
     headers: { Authorization: `Bearer ${token}` },
   });
+
+  if (res.status === 401) {
+    clearStoredAccessToken();
+    notifyAuthListeners(auth.currentUser);
+    throw new Error('انتهت صلاحية جلسة Google Drive، يرجى تسجيل الدخول مجدداً');
+  }
 
   return res.ok;
 }
@@ -356,8 +439,8 @@ export async function checkAndRunDailyBackup(): Promise<boolean> {
     return false; // Already backed up today!
   }
 
-  if (!cachedAccessToken) {
-    return false; // Token not in memory; will backup next time user connects
+  if (!getDriveAccessToken()) {
+    return false; // Token not available; will backup next time user connects
   }
 
   try {

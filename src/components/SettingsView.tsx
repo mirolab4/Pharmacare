@@ -532,10 +532,12 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
             <div className="flex flex-col sm:flex-row items-center justify-between gap-3">
               <div className="text-xs text-slate-700 dark:text-slate-300 space-y-1">
                 <span className="font-bold block text-slate-900 dark:text-white">
-                  ربط Google Drive بالصيدلية
+                  {driveAuth.user ? `تنشيط تفويض Drive (${driveAuth.user.email})` : 'ربط Google Drive بالصيدلية'}
                 </span>
                 <p className="text-[11px] text-slate-500">
-                  قم بتسجيل الدخول بحساب Google لتمكين حفظ النسخ الاحتياطية اليومية لبيانات الصيدلية تلقائياً في مجلد PharmaCare_Backups.
+                  {driveAuth.user 
+                    ? 'انتهت صلاحية جلسة التصريح المؤقتة لـ Google Drive. اضغط على الزر لتنشيط الاتصال بضغطة واحدة.' 
+                    : 'قم بتسجيل الدخول بحساب Google لتمكين حفظ النسخ الاحتياطية اليومية لبيانات الصيدلية تلقائياً في مجلد PharmaCare_Backups.'}
                 </p>
               </div>
 
@@ -552,7 +554,11 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
                   <path fill="#FBBC05" d="M10.53 28.59c-.48-1.45-.76-2.99-.76-4.59s.27-3.14.76-4.59l-7.98-6.19C.92 16.46 0 20.12 0 24c0 3.88.92 7.54 2.56 10.78l7.97-6.19z"/>
                   <path fill="#34A853" d="M24 48c6.48 0 11.93-2.13 15.89-5.81l-7.73-6c-2.15 1.45-4.92 2.3-8.16 2.3-6.26 0-11.57-4.22-13.47-9.91l-7.98 6.19C6.51 42.62 14.62 48 24 48z"/>
                 </svg>
-                <span>{isSigningInDrive ? 'جاري الاتصال بـ Google...' : 'تسجيل الدخول وربط Google Drive'}</span>
+                <span>
+                  {isSigningInDrive 
+                    ? 'جاري الاتصال بـ Google...' 
+                    : (driveAuth.user ? 'تنشيط تفويض Google Drive' : 'تسجيل الدخول وربط Google Drive')}
+                </span>
               </button>
             </div>
           )}
