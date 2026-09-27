@@ -101,5 +101,10 @@ service cloud.firestore {
       allow read: if true;
       allow write: if isPharmacyUser() && isValidId(settingsId);
     }
+
+    // Cloud Backups
+    match /backups/{backupId} {
+      allow read, write: if isPharmacyUser() && isValidId(backupId);
+    }
   }
 }

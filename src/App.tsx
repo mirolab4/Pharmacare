@@ -25,7 +25,7 @@ import { CustomerDisplayView } from './components/CustomerDisplayView';
 
 import { pharmacyStorage } from './services/storage';
 import { firebaseSync } from './services/firebaseSync';
-import { checkAndRunDailyBackup } from './services/googleDrive';
+import { checkAndRunDailyBackup, triggerSilentCloudBackup } from './services/googleDrive';
 import { 
   MainTab, 
   Product, 
@@ -139,19 +139,39 @@ export default function App() {
     setVouchers(pharmacyStorage.getVouchers());
   }, []);
 
-  // Listen to Firestore real-time sync updates and check daily Google Drive backup
+  // Listen to Firestore real-time sync updates, remote data pull, and periodic silent cloud backup
   useEffect(() => {
+    const unsubscribePulled = firebaseSync.onDataPulled(() => {
+      refreshAllState();
+    });
+
     const unsubscribeSync = firebaseSync.onStatusChange((status) => {
       if (status === 'synced') {
         refreshAllState();
       }
     });
 
-    // Check automated daily Google Drive backup
+    // Check automated daily silent cloud backup on load
     checkAndRunDailyBackup().catch((e) => console.log('Daily backup auto check:', e));
 
+    // Listen to network reconnection to sync and perform background cloud backup
+    const handleOnline = () => {
+      checkAndRunDailyBackup().catch(() => {});
+    };
+    window.addEventListener('online', handleOnline);
+
+    // Periodic background silent cloud backup check every 15 minutes
+    const backupInterval = setInterval(() => {
+      if (typeof navigator !== 'undefined' && navigator.onLine) {
+        checkAndRunDailyBackup().catch(() => {});
+      }
+    }, 15 * 60 * 1000);
+
     return () => {
+      unsubscribePulled();
       unsubscribeSync();
+      window.removeEventListener('online', handleOnline);
+      clearInterval(backupInterval);
     };
   }, [refreshAllState]);
 
@@ -318,6 +338,17 @@ export default function App() {
   };
 
   // 7. Backup & Export / Import / Reset / 5000 Items
+  // Quick silent cloud backup (uploads directly to cloud without downloading to browser)
+  const handleQuickCloudBackup = async () => {
+    try {
+      const res = await triggerSilentCloudBackup();
+      if (isSoundOn) playSuccess();
+      alert(res.message);
+    } catch (e: any) {
+      alert('حدث خطأ أثناء الرفع السحابي: ' + (e?.message || 'خطأ غير معروف'));
+    }
+  };
+
   const handleExportBackup = () => {
     const jsonStr = pharmacyStorage.exportBackupJSON();
     const blob = new Blob([jsonStr], { type: 'application/json' });
@@ -413,7 +444,7 @@ export default function App() {
         onToggleHideProfit={handleToggleMagicEye}
         onToggleSound={handleToggleSound}
         onOpenScanner={() => openScanner()}
-        onQuickBackup={handleExportBackup}
+        onQuickBackup={handleQuickCloudBackup}
         isContinuousScannerOn={isContinuousScannerOn}
         onToggleContinuousScanner={() => setIsContinuousScannerOn((prev) => !prev)}
         onOpenDeviceLink={() => setIsDeviceLinkOpen(true)}

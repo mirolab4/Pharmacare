@@ -37,8 +37,7 @@ import {
   initDriveAuth,
   DriveAuthState,
   getDriveAccessToken,
-  shareBackupToDriveDirectly,
-  canShareBackupDirectly
+  triggerSilentCloudBackup
 } from '../services/googleDrive';
 
 interface SettingsViewProps {
@@ -94,8 +93,6 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
   const [driveOperationLoading, setDriveOperationLoading] = useState(false);
   const [driveStatusMessage, setDriveStatusMessage] = useState<{ text: string; type: 'success' | 'error' } | null>(null);
   const [unauthorizedDomain, setUnauthorizedDomain] = useState<string | null>(null);
-  const [isDirectSharing, setIsDirectSharing] = useState(false);
-  const [directShareSuccess, setDirectShareSuccess] = useState(false);
 
   // Confirmation Modals for Destructive Drive Operations (per guidelines)
   const [restoreConfirmFile, setRestoreConfirmFile] = useState<DriveBackupFile | null>(null);
@@ -223,48 +220,32 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
     }
   };
 
-  // Direct share to Google Drive on phone/desktop without requiring OAuth setup
-  const handleDirectShareBackup = async () => {
-    setIsDirectSharing(true);
-    try {
-      const ok = await shareBackupToDriveDirectly();
-      if (ok) {
-        setDirectShareSuccess(true);
-        setTimeout(() => setDirectShareSuccess(false), 5000);
-      }
-    } catch (err: any) {
-      if (err.name !== 'AbortError') {
-        alert('تعذر فتح نافذة المشاركة. يمكنك تصدير الملف واستيراده يدوياً.');
-      }
-    } finally {
-      setIsDirectSharing(false);
-    }
-  };
-
-  // Instant Drive Backup via API
+  // Instant Cloud & Google Drive Backup (direct to cloud, no browser download)
   const handleCreateDriveBackup = async () => {
     setDriveOperationLoading(true);
     setDriveStatusMessage(null);
     setUnauthorizedDomain(null);
     try {
-      const uploadedFile = await uploadBackupToDrive(false);
+      const res = await triggerSilentCloudBackup();
       setDriveStatusMessage({
-        text: `تم رفع النسخة الاحتياطية بنجاح إلى مجلد PharmaCare_Backups على حساب Google Drive (${uploadedFile.name})`,
-        type: 'success',
+        text: res.message,
+        type: res.driveSuccess || res.firestoreSuccess ? 'success' : 'error',
       });
-      await fetchDriveBackupsList();
+      if (res.driveSuccess) {
+        await fetchDriveBackupsList();
+      }
     } catch (err: any) {
       const msg = err?.message || 'خطأ غير معروف';
       if (msg.includes('auth/unauthorized-domain')) {
         const domain = typeof window !== 'undefined' ? window.location.hostname : 'mirolab4.github.io';
         setUnauthorizedDomain(domain);
         setDriveStatusMessage({
-          text: `النطاق (${domain}) غير مصرح به في Firebase Console. راجع الخطوات أدناه أو احفظ عبر تطبيق Drive المباشر.`,
+          text: `النطاق (${domain}) غير مصرح به في Firebase Console. راجع الخطوات أدناه لإضافته.`,
           type: 'error',
         });
       } else {
         setDriveStatusMessage({
-          text: `فشل رفع النسخة إلى Google Drive: ${msg}`,
+          text: `فشل الرفع السحابي: ${msg}`,
           type: 'error',
         });
       }
@@ -453,41 +434,11 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
           </div>
         </div>
 
-        {/* Option A: Direct Mobile & Desktop Save to Google Drive without OAuth */}
-        <div className="p-4 rounded-xl bg-emerald-50/80 dark:bg-emerald-950/40 border border-emerald-300 dark:border-emerald-800 flex flex-col sm:flex-row items-start sm:items-center justify-between gap-3">
-          <div className="space-y-1">
-            <span className="font-bold text-xs text-emerald-950 dark:text-emerald-200 flex items-center gap-1.5">
-              <CloudUpload className="h-4 w-4 text-emerald-600 shrink-0" />
-              <span>طريقة 1: حفظ ومشاركة مباشرة في تطبيق Google Drive 📱 (تعمل فوراً دون تسجيل دخول)</span>
-            </span>
-            <p className="text-[11px] text-slate-600 dark:text-slate-300">
-              تفتح نافذة المشاركة على هاتفك أو حاسوبك لاختيار تطبيق Google Drive وتحديد المجلد الذي تريده مباشرة.
-            </p>
-          </div>
-
-          <button
-            type="button"
-            onClick={handleDirectShareBackup}
-            disabled={isDirectSharing}
-            className="w-full sm:w-auto shrink-0 flex items-center justify-center gap-2 rounded-xl bg-emerald-600 px-4 py-2.5 text-xs font-extrabold text-white shadow-xs hover:bg-emerald-700 active:scale-95 transition-all"
-          >
-            <CloudUpload className="h-4 w-4" />
-            <span>{isDirectSharing ? 'جاري الفتح...' : 'حفظ في تطبيق Google Drive 📱'}</span>
-          </button>
-        </div>
-
-        {directShareSuccess && (
-          <div className="p-3 rounded-xl bg-emerald-100 text-emerald-900 border border-emerald-300 text-xs font-bold flex items-center gap-2">
-            <CheckCircle2 className="h-4 w-4 text-emerald-600" />
-            <span>تم فتح نافذة المشاركة وحفظ الملف بنجاح في Google Drive!</span>
-          </div>
-        )}
-
-        {/* Option B: Automatic Cloud API Sync with Google Drive */}
+        {/* Google Drive Direct Cloud Sync */}
         <div className="p-4 rounded-xl bg-slate-50 dark:bg-slate-800 border border-slate-200 dark:border-slate-700 space-y-3">
           <div className="font-bold text-xs text-slate-900 dark:text-white flex items-center gap-1.5">
             <HardDrive className="h-4 w-4 text-sky-600" />
-            <span>طريقة 2: المزامنة السحابية المباشرة مع Google Drive API (النسخ التلقائي كل 24 ساعة)</span>
+            <span>الربط السحابي المباشر مع Google Drive (نسخ وحفظ في الخلفية دون تنزيل ملفات)</span>
           </div>
 
           {driveAuth.hasDriveAccess && driveAuth.user ? (
@@ -646,7 +597,7 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
             className="flex items-center justify-center gap-2 rounded-xl bg-emerald-600 px-5 py-2.5 text-xs font-extrabold text-white shadow-xs hover:bg-emerald-700 active:scale-95 transition-all"
           >
             <CloudUpload className={`h-4 w-4 ${driveOperationLoading ? 'animate-bounce' : ''}`} />
-            <span>{driveOperationLoading ? 'جاري الرفع إلى Drive...' : 'رفع سحابي فوري إلى مجلد Drive (API) 🚀'}</span>
+            <span>{driveOperationLoading ? 'جاري الرفع المباشر إلى السحابة...' : 'رفع نسخة احتياطية سحابية فورية إلى السحابة و Google Drive 🚀'}</span>
           </button>
 
           {driveAuth.hasDriveAccess && (

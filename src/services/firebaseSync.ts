@@ -93,6 +93,7 @@ class FirebaseSyncService {
   private queueKey = 'pharmacare_sync_queue';
   private lastSyncKey = 'pharmacare_last_firestore_sync';
   private statusListeners: Array<(status: SyncStatus, pendingCount: number, lastSyncTime?: string) => void> = [];
+  private dataPulledListeners: Array<() => void> = [];
   private currentStatus: SyncStatus = typeof navigator !== 'undefined' && !navigator.onLine ? 'offline' : 'synced';
   private isProcessing = false;
   private autoSyncInterval: any = null;
@@ -100,10 +101,13 @@ class FirebaseSyncService {
   constructor() {
     if (typeof window !== 'undefined') {
       // Listen to browser network changes
-      window.addEventListener('online', () => {
+      window.addEventListener('online', async () => {
         console.log('PharmaCare: Network restored, initiating auto-sync with Firebase Firestore...');
         this.updateStatus('syncing');
-        this.fullTwoWaySync();
+        const res = await this.fullTwoWaySync();
+        if (res.pulled > 0) {
+          this.notifyDataPulled();
+        }
       });
 
       window.addEventListener('offline', () => {
@@ -111,18 +115,28 @@ class FirebaseSyncService {
         this.updateStatus('offline');
       });
 
-      // Periodic queue check every 30 seconds if online
-      this.autoSyncInterval = setInterval(() => {
-        if (navigator.onLine && !this.isProcessing && this.getQueue().length > 0) {
-          this.processQueue();
+      // Periodic check every 30 seconds: push pending local changes and pull remote data
+      this.autoSyncInterval = setInterval(async () => {
+        if (typeof navigator !== 'undefined' && navigator.onLine && !this.isProcessing) {
+          if (this.getQueue().length > 0) {
+            await this.processQueue();
+          }
+          // Periodic silent pull
+          const res = await this.fullTwoWaySync();
+          if (res.pulled > 0) {
+            this.notifyDataPulled();
+          }
         }
       }, 30000);
 
-      // Initial validation
+      // Initial validation and silent background sync on start
       setTimeout(() => {
-        this.testConnection().then((online) => {
+        this.testConnection().then(async (online) => {
           if (online) {
-            this.fullTwoWaySync();
+            const res = await this.fullTwoWaySync();
+            if (res.pulled > 0) {
+              this.notifyDataPulled();
+            }
           }
         });
       }, 1500);
@@ -136,6 +150,24 @@ class FirebaseSyncService {
     return () => {
       this.statusListeners = this.statusListeners.filter(l => l !== cb);
     };
+  }
+
+  // Subscribe to remote data pull events to refresh local React state immediately
+  onDataPulled(cb: () => void) {
+    this.dataPulledListeners.push(cb);
+    return () => {
+      this.dataPulledListeners = this.dataPulledListeners.filter(l => l !== cb);
+    };
+  }
+
+  notifyDataPulled() {
+    this.dataPulledListeners.forEach(cb => {
+      try {
+        cb();
+      } catch (e) {
+        console.warn('Error in onDataPulled listener:', e);
+      }
+    });
   }
 
   private updateStatus(status: SyncStatus) {
@@ -364,11 +396,38 @@ class FirebaseSyncService {
       const now = new Date().toISOString();
       this.setLastSyncTime(now);
       this.updateStatus('synced');
+      if (pulled > 0) {
+        this.notifyDataPulled();
+      }
       return { success: true, pushed, pulled };
     } catch (e) {
       console.warn('Two-way sync pull error:', e);
       this.updateStatus('error');
       return { success: false, pushed, pulled };
+    }
+  }
+
+  /**
+   * Save a complete snapshot backup directly to Firestore /backups collection
+   * Runs silently in the background without triggering any browser downloads.
+   */
+  async saveCloudSnapshotBackup(isAutomatic: boolean = false): Promise<{ success: boolean; id?: string }> {
+    try {
+      const { pharmacyStorage } = await import('./storage');
+      const backupJson = pharmacyStorage.exportAllDataJSON();
+      const backupId = `backup_${Date.now()}`;
+      const docRef = doc(db, 'backups', backupId);
+      await setDoc(docRef, {
+        id: backupId,
+        timestamp: new Date().toISOString(),
+        type: isAutomatic ? 'auto' : 'manual',
+        data: backupJson,
+        size: `${(backupJson.length / 1024).toFixed(1)} KB`,
+      });
+      return { success: true, id: backupId };
+    } catch (err) {
+      console.warn('Cloud snapshot backup to Firestore failed silently:', err);
+      return { success: false };
     }
   }
 }

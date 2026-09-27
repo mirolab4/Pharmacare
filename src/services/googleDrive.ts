@@ -4,7 +4,7 @@
  */
 
 import { GoogleAuthProvider, signInWithPopup, User, onAuthStateChanged, signOut } from 'firebase/auth';
-import { auth } from './firebaseSync';
+import { auth, firebaseSync } from './firebaseSync';
 import { pharmacyStorage } from './storage';
 
 const SCOPES = ['https://www.googleapis.com/auth/drive.file'];
@@ -426,10 +426,51 @@ export async function shareBackupToDriveDirectly(): Promise<boolean> {
   return false;
 }
 
+export async function triggerSilentCloudBackup(): Promise<{ driveSuccess: boolean; firestoreSuccess: boolean; message: string }> {
+  let driveSuccess = false;
+  let firestoreSuccess = false;
+
+  // 1. Silent Firestore Cloud Backup Snapshot
+  try {
+    const firestoreRes = await firebaseSync.saveCloudSnapshotBackup(false);
+    firestoreSuccess = firestoreRes.success;
+  } catch (e) {
+    console.warn('Silent Firestore cloud backup failed:', e);
+  }
+
+  // 2. Direct Google Drive Cloud Upload
+  const token = getDriveAccessToken();
+  if (token) {
+    try {
+      await uploadBackupToDrive(true);
+      driveSuccess = true;
+    } catch (e) {
+      console.warn('Silent Google Drive upload failed:', e);
+    }
+  }
+
+  let message = '';
+  if (driveSuccess && firestoreSuccess) {
+    message = 'تم رفع النسخة الاحتياطية مباشرة إلى Google Drive وسحابة النظام ☁️';
+  } else if (driveSuccess) {
+    message = 'تم رفع النسخة الاحتياطية مباشرة إلى Google Drive ☁️';
+  } else if (firestoreSuccess) {
+    message = 'تم حفظ النسخة الاحتياطية السحابية بنجاح في سحابة النظام ☁️';
+  } else {
+    message = 'يرجى ربط وتنشيط Google Drive للرفع المباشر إلى حسابك.';
+  }
+
+  return { driveSuccess, firestoreSuccess, message };
+}
+
 export async function checkAndRunDailyBackup(): Promise<boolean> {
   const settings = pharmacyStorage.getSettings();
   if (settings.autoDailyDriveBackup === false) {
     return false; // User disabled auto daily backup
+  }
+
+  if (typeof navigator !== 'undefined' && !navigator.onLine) {
+    return false;
   }
 
   const today = new Date().toISOString().split('T')[0];
@@ -439,16 +480,28 @@ export async function checkAndRunDailyBackup(): Promise<boolean> {
     return false; // Already backed up today!
   }
 
-  if (!getDriveAccessToken()) {
-    return false; // Token not available; will backup next time user connects
+  let anySuccess = false;
+
+  // 1. Silent Firestore snapshot backup
+  try {
+    const res = await firebaseSync.saveCloudSnapshotBackup(true);
+    if (res.success) anySuccess = true;
+  } catch (e) {}
+
+  // 2. Silent Google Drive background upload if token available
+  if (getDriveAccessToken()) {
+    try {
+      await uploadBackupToDrive(true);
+      anySuccess = true;
+      console.log('PharmaCare: Automated silent daily backup to Google Drive completed for date:', today);
+    } catch (err) {
+      console.warn('Automated daily backup to Google Drive postponed:', err);
+    }
   }
 
-  try {
-    await uploadBackupToDrive(true);
-    console.log('Automated daily backup to Google Drive completed successfully for date:', today);
-    return true;
-  } catch (err) {
-    console.warn('Automated daily backup to Google Drive postponed:', err);
-    return false;
+  if (anySuccess) {
+    localStorage.setItem(LAST_BACKUP_DATE_KEY, today);
   }
+
+  return anySuccess;
 }

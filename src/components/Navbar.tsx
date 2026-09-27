@@ -27,7 +27,8 @@ import {
   Monitor,
   Smartphone,
   Cloud,
-  CloudOff
+  CloudOff,
+  CloudUpload
 } from 'lucide-react';
 import { MainTab, Settings } from '../types/pharmacy';
 import { PWAInstallButton } from './PWAInstallButton';
@@ -264,14 +265,14 @@ export const Navbar: React.FC<NavbarProps> = ({
               </span>
             </button>
 
-            {/* Quick Backup (hidden on small phone, available in More menu) */}
+            {/* Quick Cloud Backup (uploads directly to cloud without downloading to browser) */}
             <button
               onClick={onQuickBackup}
-              className="hidden lg:flex items-center gap-1 min-h-[38px] rounded-xl bg-teal-50 px-3 py-1.5 text-xs font-bold text-teal-700 hover:bg-teal-100 dark:bg-teal-950 dark:text-teal-300 transition-colors"
-              title="تصدير نسخة احتياطية فورية JSON"
+              className="hidden lg:flex items-center gap-1.5 min-h-[38px] rounded-xl bg-teal-50 px-3 py-1.5 text-xs font-bold text-teal-700 hover:bg-teal-100 dark:bg-teal-950 dark:text-teal-300 transition-colors"
+              title="رفع وحفظ نسخة احتياطية فورية في Google Drive وسحابة النظام"
             >
-              <Download className="h-4 w-4" />
-              <span>نسخ احتياطي</span>
+              <CloudUpload className="h-4 w-4 text-teal-600" />
+              <span>نسخ سحابي ☁️</span>
             </button>
 
             {/* Mobile Menu Toggle Button */}
