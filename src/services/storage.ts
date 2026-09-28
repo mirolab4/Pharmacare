@@ -14,7 +14,7 @@ import {
   StockMovement 
 } from '../types/pharmacy';
 import { recalculateUnitHierarchyPrices } from '../utils/unitsHelper';
-import { firebaseSync } from './firebaseSync';
+import { firebaseSync, saveDocToFirestore, deleteDocFromFirestore } from './firebaseSync';
 
 const STORAGE_KEYS = {
   SETTINGS: 'pharmacare_settings',
@@ -361,6 +361,7 @@ class PharmacyStorageService {
 
   saveSettings(settings: Settings): void {
     this.setItem(STORAGE_KEYS.SETTINGS, settings);
+    saveDocToFirestore('settings', 'current', settings);
     firebaseSync.enqueue('settings', 'current', settings);
     fetch('/api/settings', {
       method: 'POST',
@@ -380,6 +381,7 @@ class PharmacyStorageService {
     if (index >= 0) list[index] = ingredient;
     else list.push(ingredient);
     this.setItem(STORAGE_KEYS.INGREDIENTS, list);
+    saveDocToFirestore('ingredients', ingredient.id, ingredient);
     firebaseSync.enqueue('ingredients', ingredient.id, ingredient);
     fetch('/api/ingredients', {
       method: 'POST',
@@ -391,6 +393,7 @@ class PharmacyStorageService {
   deleteIngredient(id: string): void {
     const list = this.getIngredients().filter(i => i.id !== id);
     this.setItem(STORAGE_KEYS.INGREDIENTS, list);
+    deleteDocFromFirestore('ingredients', id);
     firebaseSync.enqueue('ingredients', id, null, 'delete');
   }
 
@@ -405,6 +408,7 @@ class PharmacyStorageService {
     if (index >= 0) list[index] = category;
     else list.push(category);
     this.setItem(STORAGE_KEYS.CATEGORIES, list);
+    saveDocToFirestore('categories', category.id, category);
     firebaseSync.enqueue('categories', category.id, category);
     fetch('/api/categories', {
       method: 'POST',
@@ -416,6 +420,7 @@ class PharmacyStorageService {
   deleteCategory(id: string): void {
     const list = this.getCategories().filter(c => c.id !== id);
     this.setItem(STORAGE_KEYS.CATEGORIES, list);
+    deleteDocFromFirestore('categories', id);
     firebaseSync.enqueue('categories', id, null, 'delete');
   }
 
@@ -430,6 +435,7 @@ class PharmacyStorageService {
     if (index >= 0) list[index] = manufacturer;
     else list.push(manufacturer);
     this.setItem(STORAGE_KEYS.MANUFACTURERS, list);
+    saveDocToFirestore('manufacturers', manufacturer.id, manufacturer);
     firebaseSync.enqueue('manufacturers', manufacturer.id, manufacturer);
     fetch('/api/manufacturers', {
       method: 'POST',
@@ -441,6 +447,7 @@ class PharmacyStorageService {
   deleteManufacturer(id: string): void {
     const list = this.getManufacturers().filter(m => m.id !== id);
     this.setItem(STORAGE_KEYS.MANUFACTURERS, list);
+    deleteDocFromFirestore('manufacturers', id);
     firebaseSync.enqueue('manufacturers', id, null, 'delete');
   }
 
@@ -474,6 +481,9 @@ class PharmacyStorageService {
       list.unshift(updatedProduct);
     }
     this.setItem(STORAGE_KEYS.PRODUCTS, list);
+    
+    // Direct Firestore write (Real-time sync to all devices)
+    saveDocToFirestore('products', updatedProduct.id, updatedProduct);
     firebaseSync.enqueue('products', updatedProduct.id, updatedProduct);
 
     // Sync to PostgreSQL backend
@@ -487,6 +497,7 @@ class PharmacyStorageService {
   deleteProduct(id: string): void {
     const list = this.getProducts().filter(p => p.id !== id);
     this.setItem(STORAGE_KEYS.PRODUCTS, list);
+    deleteDocFromFirestore('products', id);
     firebaseSync.enqueue('products', id, null, 'delete');
     fetch(`/api/products/${id}`, { method: 'DELETE' }).catch(() => {});
   }
@@ -511,6 +522,7 @@ class PharmacyStorageService {
     if (index >= 0) list[index] = bank;
     else list.push(bank);
     this.setItem(STORAGE_KEYS.BANKS, list);
+    saveDocToFirestore('banks', bank.id, bank);
     firebaseSync.enqueue('banks', bank.id, bank);
 
     fetch('/api/banks', {
@@ -523,6 +535,7 @@ class PharmacyStorageService {
   deleteBank(id: string): void {
     const list = this.getBanks().filter(b => b.id !== id);
     this.setItem(STORAGE_KEYS.BANKS, list);
+    deleteDocFromFirestore('banks', id);
     firebaseSync.enqueue('banks', id, null, 'delete');
   }
 
@@ -568,6 +581,7 @@ class PharmacyStorageService {
     if (index >= 0) list[index] = customer;
     else list.push(customer);
     this.setItem(STORAGE_KEYS.CUSTOMERS, list);
+    saveDocToFirestore('customers', customer.id, customer);
     firebaseSync.enqueue('customers', customer.id, customer);
 
     fetch('/api/customers', {
@@ -580,6 +594,7 @@ class PharmacyStorageService {
   deleteCustomer(id: string): void {
     const list = this.getCustomers().filter(c => c.id !== id);
     this.setItem(STORAGE_KEYS.CUSTOMERS, list);
+    deleteDocFromFirestore('customers', id);
     firebaseSync.enqueue('customers', id, null, 'delete');
   }
 
@@ -594,6 +609,7 @@ class PharmacyStorageService {
     if (index >= 0) list[index] = supplier;
     else list.push(supplier);
     this.setItem(STORAGE_KEYS.SUPPLIERS, list);
+    saveDocToFirestore('suppliers', supplier.id, supplier);
     firebaseSync.enqueue('suppliers', supplier.id, supplier);
 
     fetch('/api/suppliers', {
@@ -606,6 +622,8 @@ class PharmacyStorageService {
   deleteSupplier(id: string): void {
     const list = this.getSuppliers().filter(s => s.id !== id);
     this.setItem(STORAGE_KEYS.SUPPLIERS, list);
+    deleteDocFromFirestore('suppliers', id);
+    firebaseSync.enqueue('suppliers', id, null, 'delete');
   }
 
   // حركات المخزون
@@ -686,6 +704,7 @@ class PharmacyStorageService {
     this.setItem(STORAGE_KEYS.PRODUCTS, products);
     this.setItem(STORAGE_KEYS.STOCK_MOVEMENTS, movements);
     this.setItem(STORAGE_KEYS.INVOICES, invoices);
+    saveDocToFirestore('invoices', invoice.id, invoice);
     firebaseSync.enqueue('invoices', invoice.id, invoice);
 
     // Sync to PostgreSQL backend
@@ -759,6 +778,7 @@ class PharmacyStorageService {
     this.setItem(STORAGE_KEYS.PRODUCTS, products);
     this.setItem(STORAGE_KEYS.STOCK_MOVEMENTS, movements);
     this.setItem(STORAGE_KEYS.INVOICES, invoices);
+    saveDocToFirestore('invoices', invoice.id, invoice);
     firebaseSync.enqueue('invoices', invoice.id, invoice);
 
     fetch(`/api/invoices/${invoiceId}/cancel`, { method: 'POST' }).catch(() => {});
@@ -864,6 +884,7 @@ class PharmacyStorageService {
     this.setItem(STORAGE_KEYS.PRODUCTS, products);
     this.setItem(STORAGE_KEYS.STOCK_MOVEMENTS, movements);
     this.setItem(STORAGE_KEYS.PURCHASES, purchases);
+    saveDocToFirestore('purchases', purchase.id, purchase);
     firebaseSync.enqueue('purchases', purchase.id, purchase);
 
     // Sync to PostgreSQL backend
@@ -936,6 +957,7 @@ class PharmacyStorageService {
     this.setItem(STORAGE_KEYS.PRODUCTS, products);
     this.setItem(STORAGE_KEYS.STOCK_MOVEMENTS, movements);
     this.setItem(STORAGE_KEYS.PURCHASES, purchases);
+    saveDocToFirestore('purchases', purchase.id, purchase);
     firebaseSync.enqueue('purchases', purchase.id, purchase);
 
     fetch(`/api/purchases/${purchaseId}/cancel`, { method: 'POST' }).catch(() => {});
@@ -1007,6 +1029,7 @@ class PharmacyStorageService {
     }
 
     this.setItem(STORAGE_KEYS.VOUCHERS, vouchers);
+    saveDocToFirestore('vouchers', voucher.id, voucher);
     firebaseSync.enqueue('vouchers', voucher.id, voucher);
 
     fetch('/api/vouchers', {
@@ -1041,6 +1064,7 @@ class PharmacyStorageService {
 
     vouchers.splice(vIndex, 1);
     this.setItem(STORAGE_KEYS.VOUCHERS, vouchers);
+    deleteDocFromFirestore('vouchers', voucherId);
     firebaseSync.enqueue('vouchers', voucherId, null, 'delete');
   }
 
@@ -1126,6 +1150,8 @@ class PharmacyStorageService {
   deleteInvoice(invoiceId: string): void {
     const list = this.getInvoices().filter(i => i.id !== invoiceId);
     this.setItem(STORAGE_KEYS.INVOICES, list);
+    deleteDocFromFirestore('invoices', invoiceId);
+    firebaseSync.enqueue('invoices', invoiceId, null, 'delete');
     fetch(`/api/invoices/${invoiceId}`, { method: 'DELETE' }).catch(() => {});
   }
 
@@ -1295,6 +1321,59 @@ class PharmacyStorageService {
     });
     const sorted = Array.from(map.values()).sort((a, b) => new Date(b.date).getTime() - new Date(a.date).getTime());
     this.setItem(STORAGE_KEYS.VOUCHERS, sorted);
+  }
+
+  mergeRemoteCategories(remote: Category[]): void {
+    if (!remote || remote.length === 0) return;
+    const local = this.getCategories();
+    const map = new Map<string, Category>();
+    remote.forEach(c => map.set(c.id, c));
+    local.forEach(c => {
+      if (!map.has(c.id)) {
+        map.set(c.id, c);
+      }
+    });
+    this.setItem(STORAGE_KEYS.CATEGORIES, Array.from(map.values()));
+  }
+
+  // تصدير ملف إكسل محلي (CSV) للأصناف والمخزون بدون إنترنت
+  exportProductsToCSV(): void {
+    const products = this.getProducts();
+    const categories = this.getCategories();
+    const catMap = new Map(categories.map(c => [c.id, c.name]));
+    
+    let csvContent = '\uFEFF'; // UTF-8 BOM for Arabic support in Excel
+    csvContent += 'اسم الصنف العربي,اسم الصنف الإنجليزي,الباركود,النوع,التصنيف,سعر البيع الأساسي,سعر الشراء (التكلفة),الرصيد بالمخزن,تاريخ الإضافة\n';
+    
+    products.forEach(p => {
+      const baseUnit = p.units?.find(u => u.isBaseUnit) || p.units?.[0];
+      const salePrice = baseUnit?.salePrice || p.lastSalePrice || 0;
+      const costPrice = baseUnit?.costPrice || p.lastCostPrice || 0;
+      const catName = p.categoryId ? (catMap.get(p.categoryId) || '') : '';
+      
+      const row = [
+        `"${(p.nameAr || '').replace(/"/g, '""')}"`,
+        `"${(p.nameEn || '').replace(/"/g, '""')}"`,
+        `"${p.barcode || ''}"`,
+        `"${p.type === 'medicine' ? 'دواء' : 'تجاري'}"`,
+        `"${catName.replace(/"/g, '""')}"`,
+        salePrice,
+        costPrice,
+        p.stock || 0,
+        `"${p.createdAt || ''}"`
+      ];
+      csvContent += row.join(',') + '\n';
+    });
+
+    const blob = new Blob([csvContent], { type: 'text/csv;charset=utf-8;' });
+    const url = URL.createObjectURL(blob);
+    const link = document.createElement('a');
+    link.href = url;
+    link.download = `PharmaCare_Inventory_${new Date().toISOString().split('T')[0]}.csv`;
+    document.body.appendChild(link);
+    link.click();
+    document.body.removeChild(link);
+    URL.revokeObjectURL(url);
   }
 
   exportBackupJSON(): string { return this.exportAllDataJSON(); }

@@ -24,7 +24,14 @@ import { QuickStockAuditModal } from './components/QuickStockAuditModal';
 import { CustomerDisplayView } from './components/CustomerDisplayView';
 
 import { pharmacyStorage } from './services/storage';
-import { firebaseSync } from './services/firebaseSync';
+import { 
+  firebaseSync, 
+  subscribeToProducts, 
+  subscribeToCategories, 
+  subscribeToInvoices, 
+  subscribeToCustomers, 
+  subscribeToSuppliers 
+} from './services/firebaseSync';
 import { checkAndRunDailyBackup, triggerSilentCloudBackup } from './services/googleDrive';
 import { 
   MainTab, 
@@ -139,8 +146,34 @@ export default function App() {
     setVouchers(pharmacyStorage.getVouchers());
   }, []);
 
-  // Listen to Firestore real-time sync updates, remote data pull, and periodic silent cloud backup
+  // Listen to Firestore real-time sync updates across devices, remote data pull, and periodic silent cloud backup
   useEffect(() => {
+    // 1. Real-Time onSnapshot subscriptions across devices
+    const unsubProducts = subscribeToProducts((cloudProds) => {
+      pharmacyStorage.mergeRemoteProducts(cloudProds);
+      setProducts(pharmacyStorage.getProducts());
+    });
+
+    const unsubCategories = subscribeToCategories((cloudCats) => {
+      pharmacyStorage.mergeRemoteCategories(cloudCats);
+      setCategories(pharmacyStorage.getCategories());
+    });
+
+    const unsubInvoices = subscribeToInvoices((cloudInvs) => {
+      pharmacyStorage.mergeRemoteInvoices(cloudInvs);
+      setInvoices(pharmacyStorage.getInvoices());
+    });
+
+    const unsubCustomers = subscribeToCustomers((cloudCusts) => {
+      pharmacyStorage.mergeRemoteCustomers(cloudCusts);
+      setCustomers(pharmacyStorage.getCustomers());
+    });
+
+    const unsubSuppliers = subscribeToSuppliers((cloudSups) => {
+      pharmacyStorage.mergeRemoteSuppliers(cloudSups);
+      setSuppliers(pharmacyStorage.getSuppliers());
+    });
+
     const unsubscribePulled = firebaseSync.onDataPulled(() => {
       refreshAllState();
     });
@@ -168,6 +201,11 @@ export default function App() {
     }, 15 * 60 * 1000);
 
     return () => {
+      unsubProducts();
+      unsubCategories();
+      unsubInvoices();
+      unsubCustomers();
+      unsubSuppliers();
       unsubscribePulled();
       unsubscribeSync();
       window.removeEventListener('online', handleOnline);

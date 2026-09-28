@@ -2,109 +2,75 @@ rules_version = '2';
 service cloud.firestore {
   match /databases/{database}/documents {
 
-    // Default Deny All
-    match /{document=**} {
-      allow read, write: if false;
-    }
-
-    // Helper functions
+    // Validate valid document IDs
     function isValidId(id) {
-      return id is string && id.size() > 0 && id.size() <= 128 && id.matches('^[a-zA-Z0-9_\\-]+$');
+      return id is string && id.size() > 0 && id.size() <= 150;
     }
 
-    function incoming() {
-      return request.resource.data;
-    }
-
-    function existing() {
-      return resource.data;
-    }
-
-    function isSignedIn() {
-      return request.auth != null;
-    }
-
-    function isPharmacyUser() {
-      // Allow pharmacy operations without forcing manual login for cashier/POS
-      return true;
-    }
-
-    // Products
+    // Products collection (Real-time sync across devices)
     match /products/{productId} {
-      allow read: if true;
-      allow write: if isPharmacyUser() && isValidId(productId);
+      allow read, write: if isValidId(productId);
     }
 
     // Categories
     match /categories/{categoryId} {
-      allow read: if true;
-      allow write: if isPharmacyUser() && isValidId(categoryId);
+      allow read, write: if isValidId(categoryId);
     }
 
     // Manufacturers
     match /manufacturers/{manufacturerId} {
-      allow read: if true;
-      allow write: if isPharmacyUser() && isValidId(manufacturerId);
+      allow read, write: if isValidId(manufacturerId);
     }
 
     // Ingredients
     match /ingredients/{ingredientId} {
-      allow read: if true;
-      allow write: if isPharmacyUser() && isValidId(ingredientId);
+      allow read, write: if isValidId(ingredientId);
     }
 
     // Customers
     match /customers/{customerId} {
-      allow read: if isPharmacyUser();
-      allow write: if isPharmacyUser() && isValidId(customerId);
+      allow read, write: if isValidId(customerId);
     }
 
     // Suppliers
     match /suppliers/{supplierId} {
-      allow read: if isPharmacyUser();
-      allow write: if isPharmacyUser() && isValidId(supplierId);
+      allow read, write: if isValidId(supplierId);
     }
 
     // Invoices
     match /invoices/{invoiceId} {
-      allow read: if isPharmacyUser();
-      allow create, update: if isPharmacyUser() && isValidId(invoiceId);
-      allow delete: if isPharmacyUser() && isValidId(invoiceId);
+      allow read, write: if isValidId(invoiceId);
     }
 
     // Purchases
     match /purchases/{purchaseId} {
-      allow read: if isPharmacyUser();
-      allow write: if isPharmacyUser() && isValidId(purchaseId);
+      allow read, write: if isValidId(purchaseId);
     }
 
     // Vouchers
     match /vouchers/{voucherId} {
-      allow read: if isPharmacyUser();
-      allow write: if isPharmacyUser() && isValidId(voucherId);
+      allow read, write: if isValidId(voucherId);
     }
 
     // Banks
     match /banks/{bankId} {
-      allow read: if isPharmacyUser();
-      allow write: if isPharmacyUser() && isValidId(bankId);
+      allow read, write: if isValidId(bankId);
     }
 
     // Stock Movements
     match /stockMovements/{movementId} {
-      allow read: if isPharmacyUser();
-      allow create: if isPharmacyUser() && isValidId(movementId);
+      allow read, write: if isValidId(movementId);
     }
 
     // Settings
     match /settings/{settingsId} {
-      allow read: if true;
-      allow write: if isPharmacyUser() && isValidId(settingsId);
+      allow read, write: if isValidId(settingsId);
     }
 
     // Cloud Backups
     match /backups/{backupId} {
-      allow read, write: if isPharmacyUser() && isValidId(backupId);
+      allow read, write: if isValidId(backupId);
     }
   }
 }
+

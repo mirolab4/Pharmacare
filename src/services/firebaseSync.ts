@@ -9,14 +9,18 @@ import {
   getFirestore, 
   doc, 
   setDoc, 
+  deleteDoc,
   getDocs, 
   collection, 
+  onSnapshot,
   getDocFromServer,
   writeBatch,
-  enableIndexedDbPersistence
+  enableIndexedDbPersistence,
+  Unsubscribe
 } from 'firebase/firestore';
 import { getAuth } from 'firebase/auth';
 import firebaseConfig from '../../firebase-applet-config.json';
+import { Product, Category, Invoice, Customer, Supplier, Purchase, Voucher, Bank, Settings } from '../types/pharmacy';
 
 // Initialize Firebase App
 const app = getApps().length === 0 ? initializeApp(firebaseConfig) : getApp();
@@ -331,7 +335,8 @@ class FirebaseSyncService {
 
   // Perform full two-way synchronization:
   // 1. Flush local queue (offline changes) to Firestore
-  // 2. Pull remote changes from Firestore to local storage
+  // 2. Push all local records to ensure Cloud has complete inventory
+  // 3. Pull remote changes from Firestore to local storage
   async fullTwoWaySync(): Promise<{ success: boolean; pushed: number; pulled: number }> {
     if (typeof navigator !== 'undefined' && !navigator.onLine) {
       this.updateStatus('offline');
@@ -339,23 +344,74 @@ class FirebaseSyncService {
     }
 
     this.updateStatus('syncing');
-    const initialQueueCount = this.getQueue().length;
-    
-    // Step 1: Push offline changes first
-    await this.processQueue();
-    const remainingCount = this.getQueue().length;
-    const pushed = initialQueueCount - remainingCount;
-
-    // Step 2: Import dynamic storage to pull and merge without circular imports
+    let pushed = 0;
     let pulled = 0;
+    
     try {
       const { pharmacyStorage } = await import('./storage');
-      
-      // Pull products
+
+      // Step 1: Push offline queued changes first
+      await this.processQueue();
+
+      // Step 2: Push local records to Firestore so both devices share the exact database
+      const prods = pharmacyStorage.getProducts();
+      if (prods.length > 0) {
+        for (let i = 0; i < prods.length; i += 25) {
+          const chunk = prods.slice(i, i + 25);
+          const batch = writeBatch(db);
+          chunk.forEach(p => batch.set(doc(db, 'products', p.id), JSON.parse(JSON.stringify(p)), { merge: true }));
+          await batch.commit();
+          pushed += chunk.length;
+        }
+      }
+
+      const cats = pharmacyStorage.getCategories();
+      if (cats.length > 0) {
+        const catBatch = writeBatch(db);
+        cats.forEach(c => catBatch.set(doc(db, 'categories', c.id), JSON.parse(JSON.stringify(c)), { merge: true }));
+        await catBatch.commit();
+        pushed += cats.length;
+      }
+
+      const custs = pharmacyStorage.getCustomers();
+      if (custs.length > 0) {
+        const custBatch = writeBatch(db);
+        custs.forEach(c => custBatch.set(doc(db, 'customers', c.id), JSON.parse(JSON.stringify(c)), { merge: true }));
+        await custBatch.commit();
+        pushed += custs.length;
+      }
+
+      const sups = pharmacyStorage.getSuppliers();
+      if (sups.length > 0) {
+        const supBatch = writeBatch(db);
+        sups.forEach(s => supBatch.set(doc(db, 'suppliers', s.id), JSON.parse(JSON.stringify(s)), { merge: true }));
+        await supBatch.commit();
+        pushed += sups.length;
+      }
+
+      const invs = pharmacyStorage.getInvoices();
+      if (invs.length > 0) {
+        for (let i = 0; i < invs.length; i += 25) {
+          const chunk = invs.slice(i, i + 25);
+          const batch = writeBatch(db);
+          chunk.forEach(inv => batch.set(doc(db, 'invoices', inv.id), JSON.parse(JSON.stringify(inv)), { merge: true }));
+          await batch.commit();
+          pushed += chunk.length;
+        }
+      }
+
+      // Step 3: Pull products
       const cloudProducts = await this.pullCollection<any>('products');
       if (cloudProducts.length > 0) {
         pharmacyStorage.mergeRemoteProducts(cloudProducts);
         pulled += cloudProducts.length;
+      }
+
+      // Pull categories
+      const cloudCategories = await this.pullCollection<any>('categories');
+      if (cloudCategories.length > 0) {
+        pharmacyStorage.mergeRemoteCategories(cloudCategories);
+        pulled += cloudCategories.length;
       }
 
       // Pull invoices
@@ -396,9 +452,7 @@ class FirebaseSyncService {
       const now = new Date().toISOString();
       this.setLastSyncTime(now);
       this.updateStatus('synced');
-      if (pulled > 0) {
-        this.notifyDataPulled();
-      }
+      this.notifyDataPulled();
       return { success: true, pushed, pulled };
     } catch (e) {
       console.warn('Two-way sync pull error:', e);
@@ -433,3 +487,148 @@ class FirebaseSyncService {
 }
 
 export const firebaseSync = new FirebaseSyncService();
+
+/**
+ * Direct CRUD operations using Firestore SDK directly with automatic offline queue fallback
+ */
+export async function saveDocToFirestore(collectionName: string, id: string, data: any): Promise<void> {
+  try {
+    const sanitized = JSON.parse(JSON.stringify(data));
+    const docRef = doc(db, collectionName, id);
+    await setDoc(docRef, sanitized, { merge: true });
+  } catch (error) {
+    console.warn(`Firestore direct write failed for ${collectionName}/${id}:`, error);
+    firebaseSync.enqueue(collectionName, id, data, 'set');
+  }
+}
+
+export async function deleteDocFromFirestore(collectionName: string, id: string): Promise<void> {
+  try {
+    const docRef = doc(db, collectionName, id);
+    await deleteDoc(docRef);
+  } catch (error) {
+    console.warn(`Firestore direct delete failed for ${collectionName}/${id}:`, error);
+    firebaseSync.enqueue(collectionName, id, null, 'delete');
+  }
+}
+
+/**
+ * Real-Time onSnapshot subscriptions across devices
+ */
+export function subscribeToProducts(callback: (products: Product[]) => void): Unsubscribe {
+  let isInitial = true;
+  return onSnapshot(collection(db, 'products'), async (snapshot) => {
+    if (!snapshot.empty) {
+      const products = snapshot.docs.map(doc => ({ id: doc.id, ...doc.data() } as Product));
+      callback(products);
+    } else if (isInitial) {
+      isInitial = false;
+      // Seed Firestore if collection is empty
+      try {
+        const { pharmacyStorage } = await import('./storage');
+        const local = pharmacyStorage.getProducts();
+        if (local && local.length > 0) {
+          const batch = writeBatch(db);
+          local.forEach(p => batch.set(doc(db, 'products', p.id), JSON.parse(JSON.stringify(p)), { merge: true }));
+          await batch.commit();
+        }
+      } catch (e) {
+        console.warn('Initial products seed skipped:', e);
+      }
+    }
+  }, (error) => {
+    console.error('Firestore products real-time sync error:', error);
+  });
+}
+
+export function subscribeToCategories(callback: (categories: Category[]) => void): Unsubscribe {
+  let isInitial = true;
+  return onSnapshot(collection(db, 'categories'), async (snapshot) => {
+    if (!snapshot.empty) {
+      const categories = snapshot.docs.map(doc => ({ id: doc.id, ...doc.data() } as Category));
+      callback(categories);
+    } else if (isInitial) {
+      isInitial = false;
+      try {
+        const { pharmacyStorage } = await import('./storage');
+        const local = pharmacyStorage.getCategories();
+        if (local && local.length > 0) {
+          const batch = writeBatch(db);
+          local.forEach(c => batch.set(doc(db, 'categories', c.id), JSON.parse(JSON.stringify(c)), { merge: true }));
+          await batch.commit();
+        }
+      } catch (e) {
+        console.warn('Initial categories seed skipped:', e);
+      }
+    }
+  }, (error) => {
+    console.error('Firestore categories real-time sync error:', error);
+  });
+}
+
+export function subscribeToInvoices(callback: (invoices: Invoice[]) => void): Unsubscribe {
+  return onSnapshot(collection(db, 'invoices'), (snapshot) => {
+    if (!snapshot.empty) {
+      const invoices = snapshot.docs.map(doc => ({ id: doc.id, ...doc.data() } as Invoice));
+      callback(invoices);
+    }
+  }, (error) => {
+    console.error('Firestore invoices real-time sync error:', error);
+  });
+}
+
+export function subscribeToCustomers(callback: (customers: Customer[]) => void): Unsubscribe {
+  return onSnapshot(collection(db, 'customers'), (snapshot) => {
+    if (!snapshot.empty) {
+      const customers = snapshot.docs.map(doc => ({ id: doc.id, ...doc.data() } as Customer));
+      callback(customers);
+    }
+  }, (error) => {
+    console.error('Firestore customers real-time sync error:', error);
+  });
+}
+
+export function subscribeToSuppliers(callback: (suppliers: Supplier[]) => void): Unsubscribe {
+  return onSnapshot(collection(db, 'suppliers'), (snapshot) => {
+    if (!snapshot.empty) {
+      const suppliers = snapshot.docs.map(doc => ({ id: doc.id, ...doc.data() } as Supplier));
+      callback(suppliers);
+    }
+  }, (error) => {
+    console.error('Firestore suppliers real-time sync error:', error);
+  });
+}
+
+export function subscribeToPurchases(callback: (purchases: Purchase[]) => void): Unsubscribe {
+  return onSnapshot(collection(db, 'purchases'), (snapshot) => {
+    if (!snapshot.empty) {
+      const purchases = snapshot.docs.map(doc => ({ id: doc.id, ...doc.data() } as Purchase));
+      callback(purchases);
+    }
+  }, (error) => {
+    console.error('Firestore purchases real-time sync error:', error);
+  });
+}
+
+export function subscribeToVouchers(callback: (vouchers: Voucher[]) => void): Unsubscribe {
+  return onSnapshot(collection(db, 'vouchers'), (snapshot) => {
+    if (!snapshot.empty) {
+      const vouchers = snapshot.docs.map(doc => ({ id: doc.id, ...doc.data() } as Voucher));
+      callback(vouchers);
+    }
+  }, (error) => {
+    console.error('Firestore vouchers real-time sync error:', error);
+  });
+}
+
+export function subscribeToBanks(callback: (banks: Bank[]) => void): Unsubscribe {
+  return onSnapshot(collection(db, 'banks'), (snapshot) => {
+    if (!snapshot.empty) {
+      const banks = snapshot.docs.map(doc => ({ id: doc.id, ...doc.data() } as Bank));
+      callback(banks);
+    }
+  }, (error) => {
+    console.error('Firestore banks real-time sync error:', error);
+  });
+}
+

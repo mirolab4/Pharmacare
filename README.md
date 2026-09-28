@@ -75,3 +75,55 @@
 | `npm run build` | تجميع وبناء ملفات الإنتاج في مجلد `dist` |
 | `npm run preview` | معاينة نسخة الإنتاج محلياً |
 | `npm run lint` | فحص الكود وتأكيد عدم وجود أخطاء برمجية |
+| `npm run deploy:rules` | نشر وتطبيق قواعد حماية Firestore مباشرة عبر Firebase CLI |
+
+---
+
+## 🔥 4. تطبيق قواعد حماية Firestore (Security Rules) لتمكين المزامنة بين الأجهزة
+
+لضمان مزامنة الأصناف والمبيعات بين مختلف الأجهزة في الوقت الفعلي (Real-Time)، يجب التأكد من تطبيق قواعد `firestore.rules` في Firebase Console:
+
+### الطريقة 1: عبر كونسول فايربيس (سهلة وسريعة بضغطة زر):
+1. افتح مشروعك في **[Firebase Console](https://console.firebase.google.com/)**.
+2. اختر **Build** > **Firestore Database**.
+3. ادخل على تبويب **Rules** (القواعد).
+4. انسخ محتوى الملف `firestore.rules` والصقه بالكامل هناك:
+   ```rules
+   rules_version = '2';
+   service cloud.firestore {
+     match /databases/{database}/documents {
+       function isValidId(id) {
+         return id is string && id.size() > 0 && id.size() <= 150;
+       }
+       match /products/{id} { allow read, write: if isValidId(id); }
+       match /categories/{id} { allow read, write: if isValidId(id); }
+       match /manufacturers/{id} { allow read, write: if isValidId(id); }
+       match /ingredients/{id} { allow read, write: if isValidId(id); }
+       match /customers/{id} { allow read, write: if isValidId(id); }
+       match /suppliers/{id} { allow read, write: if isValidId(id); }
+       match /invoices/{id} { allow read, write: if isValidId(id); }
+       match /purchases/{id} { allow read, write: if isValidId(id); }
+       match /vouchers/{id} { allow read, write: if isValidId(id); }
+       match /banks/{id} { allow read, write: if isValidId(id); }
+       match /stockMovements/{id} { allow read, write: if isValidId(id); }
+       match /settings/{id} { allow read, write: if isValidId(id); }
+       match /backups/{id} { allow read, write: if isValidId(id); }
+     }
+   }
+   ```
+5. اضغط على زر **Publish (نشر)**.
+
+### الطريقة 2: عبر موجه الأوامر (Firebase CLI):
+```bash
+npm run deploy:rules
+```
+
+---
+
+## ☁️ 5. مزامنة Google Drive والنسخ الاحتياطي في مختلف البيئات
+
+- **على AI Studio:** يمكنك استخدام مزامنة Google Drive السحابية المباشرة.
+- **على GitHub Pages:** بسبب ارتباط OAuth Client ID بنطاقات محددة في Google Cloud Console، يُفضل استخدام:
+  - **النسخ الاحتياطي السحابي التلقائي عبر Firestore**: يعمل تلقائياً بين جميع الأجهزة دون أي تسجيل دخول.
+  - **النسخ الاحتياطي المحلي الفوري (JSON / Excel)**: يعمل بضغطة زر واحدة دون الحاجة لأي حساب أو إنترنت في صفحة الإعدادات أو عبر زر «نسخ سحابي / احتياطي» في الشريط العلوي.
+

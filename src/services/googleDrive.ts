@@ -111,6 +111,7 @@ function notifyAuthListeners(user: User | null) {
 
 /**
  * Sign in with Google requesting Google Drive scope
+ * Includes 10-second timeout fallback for environments with unregistered redirect URIs (e.g. GitHub Pages)
  */
 export async function signInWithGoogleDrive(): Promise<{ user: User; accessToken: string }> {
   try {
@@ -121,17 +122,35 @@ export async function signInWithGoogleDrive(): Promise<{ user: User; accessToken
       prompt: 'select_account',
     });
 
+    const timeoutPromise = new Promise<never>((_, reject) => {
+      setTimeout(() => {
+        reject(new Error('تعذّر الاتصال بـ Google Drive. تأكد من أنك تشغّل التطبيق من بيئة AI Studio، أو راجع إعدادات OAuth.'));
+      }, 10000);
+    });
+
     let result;
     try {
-      result = await signInWithPopup(auth, provider);
+      result = await Promise.race([
+        signInWithPopup(auth, provider),
+        timeoutPromise
+      ]);
     } catch (popupErr: any) {
       if (popupErr?.code === 'auth/cancelled-popup-request' || popupErr?.code === 'auth/popup-closed-by-user') {
         throw popupErr;
       }
-      // If error occurred with stale session, sign out cleanly and retry once
+      if (popupErr?.message && popupErr.message.includes('تعذّر الاتصال بـ Google Drive')) {
+        throw popupErr;
+      }
+      if (popupErr?.code === 'auth/unauthorized-domain') {
+        throw new Error('تعذّر الاتصال بـ Google Drive. تأكد من أنك تشغّل التطبيق من بيئة AI Studio، أو راجع إعدادات OAuth.');
+      }
+      // If error occurred with stale session, sign out cleanly and retry once with timeout
       await signOut(auth);
       clearStoredAccessToken();
-      result = await signInWithPopup(auth, provider);
+      result = await Promise.race([
+        signInWithPopup(auth, provider),
+        timeoutPromise
+      ]);
     }
 
     const credential = GoogleAuthProvider.credentialFromResult(result);
@@ -151,8 +170,11 @@ export async function signInWithGoogleDrive(): Promise<{ user: User; accessToken
     notifyAuthListeners(result.user);
     
     return { user: result.user, accessToken: token };
-  } catch (err) {
+  } catch (err: any) {
     console.error('Sign-in error with Google Drive scope:', err);
+    if (err?.code === 'auth/unauthorized-domain' || (err?.message && err.message.includes('network-request-failed'))) {
+      throw new Error('تعذّر الاتصال بـ Google Drive. تأكد من أنك تشغّل التطبيق من بيئة AI Studio، أو راجع إعدادات OAuth.');
+    }
     throw err;
   } finally {
     isSigningIn = false;
