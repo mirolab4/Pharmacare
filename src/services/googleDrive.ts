@@ -487,37 +487,36 @@ export async function triggerSilentCloudBackup(): Promise<{ driveSuccess: boolea
 
 export async function checkAndRunDailyBackup(): Promise<boolean> {
   const settings = pharmacyStorage.getSettings();
-  if (settings.autoDailyDriveBackup === false) {
-    return false; // User disabled auto daily backup
-  }
-
-  if (typeof navigator !== 'undefined' && !navigator.onLine) {
-    return false;
-  }
+  if (settings.autoDailyDriveBackup === false) return false;
+  if (typeof navigator !== 'undefined' && !navigator.onLine) return false;
 
   const today = new Date().toISOString().split('T')[0];
   const lastBackup = localStorage.getItem(LAST_BACKUP_DATE_KEY);
-
-  if (lastBackup === today) {
-    return false; // Already backed up today!
-  }
+  if (lastBackup === today) return false;
 
   let anySuccess = false;
 
-  // 1. Silent Firestore snapshot backup
+  // أولاً: نسخة Firestore السحابية التلقائية - لا تحتاج تسجيل دخول أبداً
   try {
     const res = await firebaseSync.saveCloudSnapshotBackup(true);
-    if (res.success) anySuccess = true;
-  } catch (e) {}
+    if (res.success) {
+      anySuccess = true;
+      console.log('PharmaCare: Auto Firestore snapshot backup completed for', today);
+    }
+  } catch (e) {
+    console.warn('Auto Firestore backup failed:', e);
+  }
 
-  // 2. Silent Google Drive background upload if token available
-  if (getDriveAccessToken()) {
+  // ثانياً: Google Drive فقط لو المستخدم سجّل دخول مسبقاً وعنده token
+  const token = getDriveAccessToken();
+  if (token) {
     try {
       await uploadBackupToDrive(true);
       anySuccess = true;
-      console.log('PharmaCare: Automated silent daily backup to Google Drive completed for date:', today);
+      console.log('PharmaCare: Auto Drive backup completed for', today);
     } catch (err) {
-      console.warn('Automated daily backup to Google Drive postponed:', err);
+      console.warn('Auto Drive backup postponed (token may have expired):', err);
+      // لا تُظهر خطأ للمستخدم - الـ Firestore backup كافٍ
     }
   }
 

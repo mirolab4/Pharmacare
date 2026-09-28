@@ -7,15 +7,17 @@
 import { initializeApp, getApps, getApp } from 'firebase/app';
 import { 
   getFirestore, 
+  initializeFirestore,
+  persistentLocalCache,
+  persistentMultipleTabManager,
   doc, 
   setDoc, 
-  deleteDoc,
+  deleteDoc, 
   getDocs, 
   collection, 
   onSnapshot,
   getDocFromServer,
   writeBatch,
-  enableIndexedDbPersistence,
   Unsubscribe
 } from 'firebase/firestore';
 import { getAuth } from 'firebase/auth';
@@ -23,26 +25,20 @@ import firebaseConfig from '../../firebase-applet-config.json';
 import { Product, Category, Invoice, Customer, Supplier, Purchase, Voucher, Bank, Settings } from '../types/pharmacy';
 
 // Initialize Firebase App
-const app = getApps().length === 0 ? initializeApp(firebaseConfig) : getApp();
-export const db = getFirestore(app, (firebaseConfig as any).firestoreDatabaseId);
-export const auth = getAuth(app);
-
-// Enable Firestore client-side offline persistence if supported in browser
-if (typeof window !== 'undefined') {
-  try {
-    enableIndexedDbPersistence(db).catch((err) => {
-      if (err.code === 'failed-precondition') {
-        // Multiple tabs open, persistence can only be enabled in one tab at a time.
-        console.warn('Firestore multi-tab persistence limitation');
-      } else if (err.code === 'unimplemented') {
-        // The current browser does not support all of the features required to enable persistence
-        console.warn('Firestore persistence not supported in this environment');
-      }
-    });
-  } catch (e) {
-    // Ignore if already enabled
-  }
+let _app = getApps().length === 0 ? initializeApp(firebaseConfig) : getApp();
+export const auth = getAuth(_app);
+let _db: ReturnType<typeof initializeFirestore>;
+try {
+  _db = initializeFirestore(_app, {
+    localCache: persistentLocalCache({
+      tabManager: persistentMultipleTabManager()
+    }),
+    databaseId: (firebaseConfig as any).firestoreDatabaseId || '(default)'
+  } as any, (firebaseConfig as any).firestoreDatabaseId || '(default)');
+} catch {
+  _db = getFirestore(_app, (firebaseConfig as any).firestoreDatabaseId || '(default)');
 }
+export const db = _db;
 
 // Types for sync queue
 export interface SyncQueueItem {
@@ -133,17 +129,17 @@ class FirebaseSyncService {
         }
       }, 30000);
 
-      // Initial validation and silent background sync on start
-      setTimeout(() => {
-        this.testConnection().then(async (online) => {
-          if (online) {
-            const res = await this.fullTwoWaySync();
-            if (res.pulled > 0) {
-              this.notifyDataPulled();
-            }
-          }
-        });
-      }, 1500);
+      // Initial sync with seed check
+      setTimeout(async () => {
+        if (typeof navigator !== 'undefined' && !navigator.onLine) return;
+        try {
+          await this.seedFirestoreIfEmpty();
+          const res = await this.fullTwoWaySync();
+          if (res.pulled > 0) this.notifyDataPulled();
+        } catch (e) {
+          console.warn('Initial sync skipped:', e);
+        }
+      }, 2000);
     }
   }
 
@@ -333,6 +329,37 @@ class FirebaseSyncService {
     }
   }
 
+  async seedFirestoreIfEmpty(): Promise<void> {
+    if (typeof navigator !== 'undefined' && !navigator.onLine) return;
+    try {
+      const { pharmacyStorage } = await import('./storage');
+      const prodsSnap = await getDocs(collection(db, 'products'));
+      if (prodsSnap.empty) {
+        const localProds = pharmacyStorage.getProducts();
+        if (localProds.length > 0) {
+          for (let i = 0; i < localProds.length; i += 25) {
+            const chunk = localProds.slice(i, i + 25);
+            const batch = writeBatch(db);
+            chunk.forEach(p => batch.set(doc(db, 'products', p.id), JSON.parse(JSON.stringify(p)), { merge: true }));
+            await batch.commit();
+          }
+          console.log('PharmaCare: Seeded', localProds.length, 'products to Firestore');
+        }
+      }
+      const catsSnap = await getDocs(collection(db, 'categories'));
+      if (catsSnap.empty) {
+        const localCats = pharmacyStorage.getCategories();
+        if (localCats.length > 0) {
+          const batch = writeBatch(db);
+          localCats.forEach(c => batch.set(doc(db, 'categories', c.id), JSON.parse(JSON.stringify(c)), { merge: true }));
+          await batch.commit();
+        }
+      }
+    } catch (e) {
+      console.warn('Seed Firestore skipped:', e);
+    }
+  }
+
   // Perform full two-way synchronization:
   // 1. Flush local queue (offline changes) to Firestore
   // 2. Push all local records to ensure Cloud has complete inventory
@@ -516,87 +543,83 @@ export async function deleteDocFromFirestore(collectionName: string, id: string)
  * Real-Time onSnapshot subscriptions across devices
  */
 export function subscribeToProducts(callback: (products: Product[]) => void): Unsubscribe {
-  let isInitial = true;
-  return onSnapshot(collection(db, 'products'), async (snapshot) => {
-    if (!snapshot.empty) {
-      const products = snapshot.docs.map(doc => ({ id: doc.id, ...doc.data() } as Product));
-      callback(products);
-    } else if (isInitial) {
-      isInitial = false;
-      // Seed Firestore if collection is empty
-      try {
-        const { pharmacyStorage } = await import('./storage');
-        const local = pharmacyStorage.getProducts();
-        if (local && local.length > 0) {
-          const batch = writeBatch(db);
-          local.forEach(p => batch.set(doc(db, 'products', p.id), JSON.parse(JSON.stringify(p)), { merge: true }));
-          await batch.commit();
-        }
-      } catch (e) {
-        console.warn('Initial products seed skipped:', e);
+  return onSnapshot(
+    collection(db, 'products'),
+    { includeMetadataChanges: false },
+    (snapshot) => {
+      if (!snapshot.empty) {
+        const products = snapshot.docs.map(d => ({ id: d.id, ...d.data() } as Product));
+        callback(products);
       }
+    },
+    (error) => {
+      console.error('Firestore products listener error:', error.code, error.message);
     }
-  }, (error) => {
-    console.error('Firestore products real-time sync error:', error);
-  });
+  );
 }
 
 export function subscribeToCategories(callback: (categories: Category[]) => void): Unsubscribe {
-  let isInitial = true;
-  return onSnapshot(collection(db, 'categories'), async (snapshot) => {
-    if (!snapshot.empty) {
-      const categories = snapshot.docs.map(doc => ({ id: doc.id, ...doc.data() } as Category));
-      callback(categories);
-    } else if (isInitial) {
-      isInitial = false;
-      try {
-        const { pharmacyStorage } = await import('./storage');
-        const local = pharmacyStorage.getCategories();
-        if (local && local.length > 0) {
-          const batch = writeBatch(db);
-          local.forEach(c => batch.set(doc(db, 'categories', c.id), JSON.parse(JSON.stringify(c)), { merge: true }));
-          await batch.commit();
-        }
-      } catch (e) {
-        console.warn('Initial categories seed skipped:', e);
+  return onSnapshot(
+    collection(db, 'categories'),
+    { includeMetadataChanges: false },
+    (snapshot) => {
+      if (!snapshot.empty) {
+        const categories = snapshot.docs.map(d => ({ id: d.id, ...d.data() } as Category));
+        callback(categories);
       }
+    },
+    (error) => {
+      console.error('Firestore categories listener error:', error.code, error.message);
     }
-  }, (error) => {
-    console.error('Firestore categories real-time sync error:', error);
-  });
+  );
 }
 
 export function subscribeToInvoices(callback: (invoices: Invoice[]) => void): Unsubscribe {
-  return onSnapshot(collection(db, 'invoices'), (snapshot) => {
-    if (!snapshot.empty) {
-      const invoices = snapshot.docs.map(doc => ({ id: doc.id, ...doc.data() } as Invoice));
-      callback(invoices);
+  return onSnapshot(
+    collection(db, 'invoices'),
+    { includeMetadataChanges: false },
+    (snapshot) => {
+      if (!snapshot.empty) {
+        const invoices = snapshot.docs.map(d => ({ id: d.id, ...d.data() } as Invoice));
+        callback(invoices);
+      }
+    },
+    (error) => {
+      console.error('Firestore invoices listener error:', error.code, error.message);
     }
-  }, (error) => {
-    console.error('Firestore invoices real-time sync error:', error);
-  });
+  );
 }
 
 export function subscribeToCustomers(callback: (customers: Customer[]) => void): Unsubscribe {
-  return onSnapshot(collection(db, 'customers'), (snapshot) => {
-    if (!snapshot.empty) {
-      const customers = snapshot.docs.map(doc => ({ id: doc.id, ...doc.data() } as Customer));
-      callback(customers);
+  return onSnapshot(
+    collection(db, 'customers'),
+    { includeMetadataChanges: false },
+    (snapshot) => {
+      if (!snapshot.empty) {
+        const customers = snapshot.docs.map(d => ({ id: d.id, ...d.data() } as Customer));
+        callback(customers);
+      }
+    },
+    (error) => {
+      console.error('Firestore customers listener error:', error.code, error.message);
     }
-  }, (error) => {
-    console.error('Firestore customers real-time sync error:', error);
-  });
+  );
 }
 
 export function subscribeToSuppliers(callback: (suppliers: Supplier[]) => void): Unsubscribe {
-  return onSnapshot(collection(db, 'suppliers'), (snapshot) => {
-    if (!snapshot.empty) {
-      const suppliers = snapshot.docs.map(doc => ({ id: doc.id, ...doc.data() } as Supplier));
-      callback(suppliers);
+  return onSnapshot(
+    collection(db, 'suppliers'),
+    { includeMetadataChanges: false },
+    (snapshot) => {
+      if (!snapshot.empty) {
+        const suppliers = snapshot.docs.map(d => ({ id: d.id, ...d.data() } as Supplier));
+        callback(suppliers);
+      }
+    },
+    (error) => {
+      console.error('Firestore suppliers listener error:', error.code, error.message);
     }
-  }, (error) => {
-    console.error('Firestore suppliers real-time sync error:', error);
-  });
+  );
 }
 
 export function subscribeToPurchases(callback: (purchases: Purchase[]) => void): Unsubscribe {

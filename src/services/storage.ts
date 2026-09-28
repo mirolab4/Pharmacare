@@ -14,7 +14,7 @@ import {
   StockMovement 
 } from '../types/pharmacy';
 import { recalculateUnitHierarchyPrices } from '../utils/unitsHelper';
-import { firebaseSync, saveDocToFirestore, deleteDocFromFirestore } from './firebaseSync';
+import { firebaseSync } from './firebaseSync';
 
 const STORAGE_KEYS = {
   SETTINGS: 'pharmacare_settings',
@@ -361,13 +361,7 @@ class PharmacyStorageService {
 
   saveSettings(settings: Settings): void {
     this.setItem(STORAGE_KEYS.SETTINGS, settings);
-    saveDocToFirestore('settings', 'current', settings);
     firebaseSync.enqueue('settings', 'current', settings);
-    fetch('/api/settings', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(settings),
-    }).catch(() => {});
   }
 
   // المواد الفعالة
@@ -381,19 +375,12 @@ class PharmacyStorageService {
     if (index >= 0) list[index] = ingredient;
     else list.push(ingredient);
     this.setItem(STORAGE_KEYS.INGREDIENTS, list);
-    saveDocToFirestore('ingredients', ingredient.id, ingredient);
     firebaseSync.enqueue('ingredients', ingredient.id, ingredient);
-    fetch('/api/ingredients', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(ingredient),
-    }).catch(() => {});
   }
 
   deleteIngredient(id: string): void {
     const list = this.getIngredients().filter(i => i.id !== id);
     this.setItem(STORAGE_KEYS.INGREDIENTS, list);
-    deleteDocFromFirestore('ingredients', id);
     firebaseSync.enqueue('ingredients', id, null, 'delete');
   }
 
@@ -408,19 +395,12 @@ class PharmacyStorageService {
     if (index >= 0) list[index] = category;
     else list.push(category);
     this.setItem(STORAGE_KEYS.CATEGORIES, list);
-    saveDocToFirestore('categories', category.id, category);
     firebaseSync.enqueue('categories', category.id, category);
-    fetch('/api/categories', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(category),
-    }).catch(() => {});
   }
 
   deleteCategory(id: string): void {
     const list = this.getCategories().filter(c => c.id !== id);
     this.setItem(STORAGE_KEYS.CATEGORIES, list);
-    deleteDocFromFirestore('categories', id);
     firebaseSync.enqueue('categories', id, null, 'delete');
   }
 
@@ -435,19 +415,12 @@ class PharmacyStorageService {
     if (index >= 0) list[index] = manufacturer;
     else list.push(manufacturer);
     this.setItem(STORAGE_KEYS.MANUFACTURERS, list);
-    saveDocToFirestore('manufacturers', manufacturer.id, manufacturer);
     firebaseSync.enqueue('manufacturers', manufacturer.id, manufacturer);
-    fetch('/api/manufacturers', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(manufacturer),
-    }).catch(() => {});
   }
 
   deleteManufacturer(id: string): void {
     const list = this.getManufacturers().filter(m => m.id !== id);
     this.setItem(STORAGE_KEYS.MANUFACTURERS, list);
-    deleteDocFromFirestore('manufacturers', id);
     firebaseSync.enqueue('manufacturers', id, null, 'delete');
   }
 
@@ -482,24 +455,13 @@ class PharmacyStorageService {
     }
     this.setItem(STORAGE_KEYS.PRODUCTS, list);
     
-    // Direct Firestore write (Real-time sync to all devices)
-    saveDocToFirestore('products', updatedProduct.id, updatedProduct);
     firebaseSync.enqueue('products', updatedProduct.id, updatedProduct);
-
-    // Sync to PostgreSQL backend
-    fetch('/api/products', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(updatedProduct),
-    }).catch(err => console.warn('Background sync product failed:', err));
   }
 
   deleteProduct(id: string): void {
     const list = this.getProducts().filter(p => p.id !== id);
     this.setItem(STORAGE_KEYS.PRODUCTS, list);
-    deleteDocFromFirestore('products', id);
     firebaseSync.enqueue('products', id, null, 'delete');
-    fetch(`/api/products/${id}`, { method: 'DELETE' }).catch(() => {});
   }
 
   // البنوك والمحافظ والحسابات الفرعية
@@ -522,20 +484,12 @@ class PharmacyStorageService {
     if (index >= 0) list[index] = bank;
     else list.push(bank);
     this.setItem(STORAGE_KEYS.BANKS, list);
-    saveDocToFirestore('banks', bank.id, bank);
     firebaseSync.enqueue('banks', bank.id, bank);
-
-    fetch('/api/banks', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(bank),
-    }).catch(() => {});
   }
 
   deleteBank(id: string): void {
     const list = this.getBanks().filter(b => b.id !== id);
     this.setItem(STORAGE_KEYS.BANKS, list);
-    deleteDocFromFirestore('banks', id);
     firebaseSync.enqueue('banks', id, null, 'delete');
   }
 
@@ -551,12 +505,6 @@ class PharmacyStorageService {
     else bank.subAccounts.push(sub);
 
     this.saveBank(bank);
-
-    fetch('/api/banks/sub-accounts', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(sub),
-    }).catch(() => {});
   }
 
   deleteBankSubAccount(bankId: string, subId: string): void {
@@ -566,8 +514,6 @@ class PharmacyStorageService {
 
     bank.subAccounts = bank.subAccounts.filter(s => s.id !== subId);
     this.saveBank(bank);
-
-    fetch(`/api/banks/sub-accounts/${subId}`, { method: 'DELETE' }).catch(() => {});
   }
 
   // العملاء
@@ -581,20 +527,12 @@ class PharmacyStorageService {
     if (index >= 0) list[index] = customer;
     else list.push(customer);
     this.setItem(STORAGE_KEYS.CUSTOMERS, list);
-    saveDocToFirestore('customers', customer.id, customer);
     firebaseSync.enqueue('customers', customer.id, customer);
-
-    fetch('/api/customers', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(customer),
-    }).catch(() => {});
   }
 
   deleteCustomer(id: string): void {
     const list = this.getCustomers().filter(c => c.id !== id);
     this.setItem(STORAGE_KEYS.CUSTOMERS, list);
-    deleteDocFromFirestore('customers', id);
     firebaseSync.enqueue('customers', id, null, 'delete');
   }
 
@@ -609,20 +547,12 @@ class PharmacyStorageService {
     if (index >= 0) list[index] = supplier;
     else list.push(supplier);
     this.setItem(STORAGE_KEYS.SUPPLIERS, list);
-    saveDocToFirestore('suppliers', supplier.id, supplier);
     firebaseSync.enqueue('suppliers', supplier.id, supplier);
-
-    fetch('/api/suppliers', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(supplier),
-    }).catch(() => {});
   }
 
   deleteSupplier(id: string): void {
     const list = this.getSuppliers().filter(s => s.id !== id);
     this.setItem(STORAGE_KEYS.SUPPLIERS, list);
-    deleteDocFromFirestore('suppliers', id);
     firebaseSync.enqueue('suppliers', id, null, 'delete');
   }
 
@@ -704,15 +634,7 @@ class PharmacyStorageService {
     this.setItem(STORAGE_KEYS.PRODUCTS, products);
     this.setItem(STORAGE_KEYS.STOCK_MOVEMENTS, movements);
     this.setItem(STORAGE_KEYS.INVOICES, invoices);
-    saveDocToFirestore('invoices', invoice.id, invoice);
     firebaseSync.enqueue('invoices', invoice.id, invoice);
-
-    // Sync to PostgreSQL backend
-    fetch('/api/invoices', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(invoice),
-    }).catch(err => console.warn('Background sync invoice failed:', err));
   }
 
   // إلغاء فاتورة
@@ -778,10 +700,8 @@ class PharmacyStorageService {
     this.setItem(STORAGE_KEYS.PRODUCTS, products);
     this.setItem(STORAGE_KEYS.STOCK_MOVEMENTS, movements);
     this.setItem(STORAGE_KEYS.INVOICES, invoices);
-    saveDocToFirestore('invoices', invoice.id, invoice);
     firebaseSync.enqueue('invoices', invoice.id, invoice);
 
-    fetch(`/api/invoices/${invoiceId}/cancel`, { method: 'POST' }).catch(() => {});
     return true;
   }
 
@@ -884,15 +804,7 @@ class PharmacyStorageService {
     this.setItem(STORAGE_KEYS.PRODUCTS, products);
     this.setItem(STORAGE_KEYS.STOCK_MOVEMENTS, movements);
     this.setItem(STORAGE_KEYS.PURCHASES, purchases);
-    saveDocToFirestore('purchases', purchase.id, purchase);
     firebaseSync.enqueue('purchases', purchase.id, purchase);
-
-    // Sync to PostgreSQL backend
-    fetch('/api/purchases', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(purchase),
-    }).catch(err => console.warn('Background sync purchase failed:', err));
   }
 
   cancelPurchase(purchaseId: string): boolean {
@@ -957,10 +869,8 @@ class PharmacyStorageService {
     this.setItem(STORAGE_KEYS.PRODUCTS, products);
     this.setItem(STORAGE_KEYS.STOCK_MOVEMENTS, movements);
     this.setItem(STORAGE_KEYS.PURCHASES, purchases);
-    saveDocToFirestore('purchases', purchase.id, purchase);
     firebaseSync.enqueue('purchases', purchase.id, purchase);
 
-    fetch(`/api/purchases/${purchaseId}/cancel`, { method: 'POST' }).catch(() => {});
     return true;
   }
 
@@ -1029,14 +939,7 @@ class PharmacyStorageService {
     }
 
     this.setItem(STORAGE_KEYS.VOUCHERS, vouchers);
-    saveDocToFirestore('vouchers', voucher.id, voucher);
     firebaseSync.enqueue('vouchers', voucher.id, voucher);
-
-    fetch('/api/vouchers', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(voucher),
-    }).catch(() => {});
   }
 
   deleteVoucher(voucherId: string): void {
@@ -1064,7 +967,6 @@ class PharmacyStorageService {
 
     vouchers.splice(vIndex, 1);
     this.setItem(STORAGE_KEYS.VOUCHERS, vouchers);
-    deleteDocFromFirestore('vouchers', voucherId);
     firebaseSync.enqueue('vouchers', voucherId, null, 'delete');
   }
 
@@ -1150,9 +1052,7 @@ class PharmacyStorageService {
   deleteInvoice(invoiceId: string): void {
     const list = this.getInvoices().filter(i => i.id !== invoiceId);
     this.setItem(STORAGE_KEYS.INVOICES, list);
-    deleteDocFromFirestore('invoices', invoiceId);
     firebaseSync.enqueue('invoices', invoiceId, null, 'delete');
-    fetch(`/api/invoices/${invoiceId}`, { method: 'DELETE' }).catch(() => {});
   }
 
   saveVoucher(voucher: Voucher): void {

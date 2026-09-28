@@ -213,6 +213,19 @@ export default function App() {
     };
   }, [refreshAllState]);
 
+  useEffect(() => {
+    if (typeof navigator === 'undefined' || !navigator.onLine) return;
+    const timer = setTimeout(async () => {
+      try {
+        const { firebaseSync: fs } = await import('./services/firebaseSync');
+        await fs.processQueue();
+      } catch (e) {
+        console.warn('Initial queue flush skipped:', e);
+      }
+    }, 4000);
+    return () => clearTimeout(timer);
+  }, []);
+
   // Settings update
   const handleUpdateSettings = (newSettings: Settings) => {
     pharmacyStorage.saveSettings(newSettings);
