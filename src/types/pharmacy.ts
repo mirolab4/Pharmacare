@@ -23,6 +23,10 @@ export interface Settings {
   lastDriveBackupTime?: string;
   lastDriveBackupFileName?: string;
   lastDriveBackupStatus?: 'success' | 'failed' | 'pending';
+  googleWebAppUrl?: string; // رابط تطبيق Google Apps Script Web App للنسخ التلقائي
+  backupToken?: string; // رمز الأمان السري للنسخ الاحتياطي
+  pharmacyId?: string;
+  joinCode?: string;
   lastCloudSync?: string;
   customerDisplayEnabled?: boolean;
   themeColor?: 'sky' | 'emerald' | 'indigo' | 'purple' | 'amber' | 'rose' | 'slate';
@@ -102,7 +106,9 @@ export interface Product {
   lastCostPrice?: number;
   lastSalePrice?: number;
   createdAt: string;
-  updatedAt?: string;
+  updatedAt?: any;
+  deleted?: boolean;
+  deviceId?: string;
 }
 
 export interface BankSubAccount {

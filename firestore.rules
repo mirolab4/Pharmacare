@@ -1,76 +1,24 @@
 rules_version = '2';
 service cloud.firestore {
   match /databases/{database}/documents {
-
-    // Validate valid document IDs
-    function isValidId(id) {
-      return id is string && id.size() > 0 && id.size() <= 150;
+    function isMember(pid) {
+      return request.auth != null &&
+        exists(/databases/$(database)/documents/pharmacies/$(pid)/members/$(request.auth.uid));
     }
-
-    // Products collection (Real-time sync across devices)
-    match /products/{productId} {
-      allow read, write: if isValidId(productId);
-    }
-
-    // Categories
-    match /categories/{categoryId} {
-      allow read, write: if isValidId(categoryId);
-    }
-
-    // Manufacturers
-    match /manufacturers/{manufacturerId} {
-      allow read, write: if isValidId(manufacturerId);
-    }
-
-    // Ingredients
-    match /ingredients/{ingredientId} {
-      allow read, write: if isValidId(ingredientId);
-    }
-
-    // Customers
-    match /customers/{customerId} {
-      allow read, write: if isValidId(customerId);
-    }
-
-    // Suppliers
-    match /suppliers/{supplierId} {
-      allow read, write: if isValidId(supplierId);
-    }
-
-    // Invoices
-    match /invoices/{invoiceId} {
-      allow read, write: if isValidId(invoiceId);
-    }
-
-    // Purchases
-    match /purchases/{purchaseId} {
-      allow read, write: if isValidId(purchaseId);
-    }
-
-    // Vouchers
-    match /vouchers/{voucherId} {
-      allow read, write: if isValidId(voucherId);
-    }
-
-    // Banks
-    match /banks/{bankId} {
-      allow read, write: if isValidId(bankId);
-    }
-
-    // Stock Movements
-    match /stockMovements/{movementId} {
-      allow read, write: if isValidId(movementId);
-    }
-
-    // Settings
-    match /settings/{settingsId} {
-      allow read, write: if isValidId(settingsId);
-    }
-
-    // Cloud Backups
-    match /backups/{backupId} {
-      allow read, write: if isValidId(backupId);
+    match /pharmacies/{pid} {
+      allow create: if request.auth != null
+        && request.resource.data.joinCode is string
+        && request.resource.data.joinCode.size() >= 8;
+      allow read, update: if isMember(pid);
+      match /members/{uid} {
+        allow read: if request.auth != null && request.auth.uid == uid;
+        allow create: if request.auth != null && request.auth.uid == uid
+          && request.resource.data.joinCode ==
+             get(/databases/$(database)/documents/pharmacies/$(pid)).data.joinCode;
+      }
+      match /{col}/{docId} {
+        allow read, write: if col != 'members' && isMember(pid);
+      }
     }
   }
 }
-

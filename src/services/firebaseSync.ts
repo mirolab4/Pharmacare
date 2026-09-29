@@ -1,7 +1,14 @@
 /**
- * Firebase Firestore Real-Time & Offline-First Bidirectional Sync Service
- * Guarantees zero-interruption pharmacy operations when offline, with automatic
- * replay and bidirectional synchronization whenever internet is restored.
+ * PharmaCare Plus - Firebase Firestore Real-Time & Offline-First Service
+ * Architecture:
+ * - Pure Serverless Client-Side PWA (GitHub Pages ready)
+ * - Single source of truth: Firestore database "(default)"
+ * - Offline Persistence via persistentLocalCache & persistentMultipleTabManager
+ * - Automatic Anonymous Authentication (Zero login friction)
+ * - Multi-device synchronization without Google accounts using Pharmacy ID & Join Code
+ * - Path schema: pharmacies/{pharmacyId}/{collectionName}/{docId}
+ * - Soft deletes (deleted: true) for cross-device deletion propagation
+ * - Atomic stock adjustments via increment()
  */
 
 import { initializeApp, getApps, getApp } from 'firebase/app';
@@ -12,147 +19,445 @@ import {
   persistentMultipleTabManager,
   doc, 
   setDoc, 
-  deleteDoc, 
-  getDocs, 
+  updateDoc,
   collection, 
   onSnapshot,
-  getDocFromServer,
-  writeBatch,
-  Unsubscribe
+  getDoc,
+  serverTimestamp,
+  increment,
+  waitForPendingWrites,
+  Unsubscribe,
+  getDocFromServer
 } from 'firebase/firestore';
-import { getAuth } from 'firebase/auth';
+import { getAuth, signInAnonymously, onAuthStateChanged, User } from 'firebase/auth';
 import firebaseConfig from '../../firebase-applet-config.json';
-import { Product, Category, Invoice, Customer, Supplier, Purchase, Voucher, Bank, Settings } from '../types/pharmacy';
+import { 
+  Product, 
+  Category, 
+  Invoice, 
+  Customer, 
+  Supplier, 
+  Purchase, 
+  Voucher, 
+  Bank, 
+  Settings, 
+  Manufacturer, 
+  Ingredient, 
+  StockMovement 
+} from '../types/pharmacy';
 
-// Initialize Firebase App
-let _app = getApps().length === 0 ? initializeApp(firebaseConfig) : getApp();
-export const auth = getAuth(_app);
+// 1. Initialize Firebase App
+const app = getApps().length === 0 ? initializeApp(firebaseConfig) : getApp();
+export const auth = getAuth(app);
+
+// 2. Initialize Firestore using the (default) database with persistent multi-tab cache
 let _db: ReturnType<typeof initializeFirestore>;
 try {
-  _db = initializeFirestore(_app, {
+  _db = initializeFirestore(app, {
     localCache: persistentLocalCache({
       tabManager: persistentMultipleTabManager()
-    }),
-    databaseId: (firebaseConfig as any).firestoreDatabaseId || '(default)'
-  } as any, (firebaseConfig as any).firestoreDatabaseId || '(default)');
+    })
+  }, '(default)');
 } catch {
-  _db = getFirestore(_app, (firebaseConfig as any).firestoreDatabaseId || '(default)');
+  _db = getFirestore(app, '(default)');
 }
 export const db = _db;
 
-// Types for sync queue
-export interface SyncQueueItem {
-  id: string;
-  collection: string;
-  action: 'set' | 'delete';
-  data?: any;
-  timestamp: number;
-}
+// Storage keys
+const PHARMACY_ID_KEY = 'pharmacare_pharmacy_id';
+const JOIN_CODE_KEY = 'pharmacare_join_code';
+const DEVICE_ID_KEY = 'pharmacare_device_id';
+const LAST_SYNC_KEY = 'pharmacare_last_firestore_sync';
 
 export type SyncStatus = 'synced' | 'syncing' | 'offline' | 'error';
 
-enum OperationType {
-  CREATE = 'create',
-  UPDATE = 'update',
-  DELETE = 'delete',
-  LIST = 'list',
-  GET = 'get',
-  WRITE = 'write',
-}
-
-interface FirestoreErrorInfo {
-  error: string;
-  operationType: OperationType;
-  path: string | null;
-  authInfo: {
-    userId?: string | null;
-    email?: string | null;
-    emailVerified?: boolean | null;
-    isAnonymous?: boolean | null;
-    tenantId?: string | null;
-  };
-}
-
-function handleFirestoreError(error: unknown, operationType: OperationType, path: string | null) {
-  const errInfo: FirestoreErrorInfo = {
-    error: error instanceof Error ? error.message : String(error),
-    authInfo: {
-      userId: auth.currentUser?.uid,
-      email: auth.currentUser?.email,
-      emailVerified: auth.currentUser?.emailVerified,
-      isAnonymous: auth.currentUser?.isAnonymous,
-      tenantId: auth.currentUser?.tenantId,
-    },
-    operationType,
-    path
-  };
-  console.warn('Firestore Operation Info: ', JSON.stringify(errInfo));
-}
-
 class FirebaseSyncService {
-  private queueKey = 'pharmacare_sync_queue';
-  private lastSyncKey = 'pharmacare_last_firestore_sync';
   private statusListeners: Array<(status: SyncStatus, pendingCount: number, lastSyncTime?: string) => void> = [];
   private dataPulledListeners: Array<() => void> = [];
+  private pharmacyListeners: Array<(pharmacyId: string | null) => void> = [];
+  private errorListeners: Array<(message: string) => void> = [];
+  
   private currentStatus: SyncStatus = typeof navigator !== 'undefined' && !navigator.onLine ? 'offline' : 'synced';
-  private isProcessing = false;
-  private autoSyncInterval: any = null;
+  private pendingCount = 0;
+  private currentUser: User | null = null;
+  private isAuthReady = false;
+  private authInitPromise: Promise<User>;
 
   constructor() {
+    // Generate or retrieve persistent unique Device ID
+    this.initDeviceId();
+
+    // Listen to network status
     if (typeof window !== 'undefined') {
-      // Listen to browser network changes
-      window.addEventListener('online', async () => {
-        console.log('PharmaCare: Network restored, initiating auto-sync with Firebase Firestore...');
+      window.addEventListener('online', () => {
         this.updateStatus('syncing');
-        const res = await this.fullTwoWaySync();
-        if (res.pulled > 0) {
-          this.notifyDataPulled();
-        }
+        this.syncNow().catch(() => {});
       });
 
       window.addEventListener('offline', () => {
-        console.log('PharmaCare: Operating in full Offline-First mode (Zero interruption)...');
         this.updateStatus('offline');
       });
+    }
 
-      // Periodic check every 30 seconds: push pending local changes and pull remote data
-      this.autoSyncInterval = setInterval(async () => {
-        if (typeof navigator !== 'undefined' && navigator.onLine && !this.isProcessing) {
-          if (this.getQueue().length > 0) {
-            await this.processQueue();
-          }
-          // Periodic silent pull
-          const res = await this.fullTwoWaySync();
-          if (res.pulled > 0) {
-            this.notifyDataPulled();
+    // Auto sign-in anonymously without any login screens
+    this.authInitPromise = new Promise((resolve) => {
+      onAuthStateChanged(auth, async (user) => {
+        if (user) {
+          this.currentUser = user;
+          this.isAuthReady = true;
+          resolve(user);
+        } else {
+          try {
+            const credential = await signInAnonymously(auth);
+            this.currentUser = credential.user;
+            this.isAuthReady = true;
+            resolve(credential.user);
+          } catch (err: any) {
+            console.error('PharmaCare Anonymous Auth Error:', err);
+            this.notifyError(this.translateFirebaseError(err));
           }
         }
-      }, 30000);
+      });
+    });
 
-      // Initial sync with seed check
-      setTimeout(async () => {
-        if (typeof navigator !== 'undefined' && !navigator.onLine) return;
-        try {
-          await this.seedFirestoreIfEmpty();
-          const res = await this.fullTwoWaySync();
-          if (res.pulled > 0) this.notifyDataPulled();
-        } catch (e) {
-          console.warn('Initial sync skipped:', e);
-        }
+    // Initial check for pending writes
+    if (typeof window !== 'undefined' && navigator.onLine) {
+      setTimeout(() => {
+        this.updatePendingCount();
       }, 2000);
     }
   }
 
-  // Subscribe to status changes
+  // --- Device & Pharmacy Identification ---
+  private initDeviceId(): string {
+    try {
+      let deviceId = localStorage.getItem(DEVICE_ID_KEY);
+      if (!deviceId) {
+        deviceId = 'dev_' + Math.random().toString(36).substring(2, 9) + '_' + Date.now().toString(36);
+        localStorage.setItem(DEVICE_ID_KEY, deviceId);
+      }
+      return deviceId;
+    } catch {
+      return 'dev_unknown';
+    }
+  }
+
+  getDeviceId(): string {
+    try {
+      return localStorage.getItem(DEVICE_ID_KEY) || this.initDeviceId();
+    } catch {
+      return 'dev_fallback';
+    }
+  }
+
+  getPharmacyId(): string | null {
+    try {
+      return localStorage.getItem(PHARMACY_ID_KEY) || null;
+    } catch {
+      return null;
+    }
+  }
+
+  getJoinCode(): string | null {
+    try {
+      return localStorage.getItem(JOIN_CODE_KEY) || null;
+    } catch {
+      return null;
+    }
+  }
+
+  isLinked(): boolean {
+    return !!this.getPharmacyId();
+  }
+
+  getPharmacyInfo(): { pharmacyId: string | null; joinCode: string | null; deviceId: string; isLinked: boolean } {
+    return {
+      pharmacyId: this.getPharmacyId(),
+      joinCode: this.getJoinCode(),
+      deviceId: this.getDeviceId(),
+      isLinked: this.isLinked()
+    };
+  }
+
+  onPharmacyChange(cb: (pharmacyId: string | null) => void) {
+    this.pharmacyListeners.push(cb);
+    return () => {
+      this.pharmacyListeners = this.pharmacyListeners.filter(l => l !== cb);
+    };
+  }
+
+  private notifyPharmacyChange(pid: string | null) {
+    this.pharmacyListeners.forEach(cb => {
+      try { cb(pid); } catch (e) { console.warn(e); }
+    });
+  }
+
+  async ensureAuth(): Promise<User> {
+    if (this.currentUser) return this.currentUser;
+    return this.authInitPromise;
+  }
+
+  /**
+   * Create a new pharmacy organization on Firestore
+   * Stores joinCode in pharmacies/{pid} and establishes membership in pharmacies/{pid}/members/{uid}
+   */
+  async createPharmacy(nameAr?: string): Promise<{ pharmacyId: string; joinCode: string }> {
+    const user = await this.ensureAuth();
+    const pid = 'pharma-' + Math.random().toString(36).substring(2, 8);
+    // Generate secure 8-character join code (uppercase + digits)
+    const chars = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789';
+    let joinCode = '';
+    for (let i = 0; i < 8; i++) {
+      joinCode += chars.charAt(Math.floor(Math.random() * chars.length));
+    }
+
+    const deviceId = this.getDeviceId();
+    const now = new Date().toISOString();
+
+    try {
+      // 1. Create pharmacy root document
+      const pharmacyDocRef = doc(db, 'pharmacies', pid);
+      await setDoc(pharmacyDocRef, {
+        joinCode,
+        nameAr: nameAr || 'صيدليتي',
+        createdAt: serverTimestamp(),
+        createdBy: user.uid,
+        createdDevice: deviceId,
+      });
+
+      // 2. Add creator as initial member
+      const memberDocRef = doc(db, 'pharmacies', pid, 'members', user.uid);
+      await setDoc(memberDocRef, {
+        joinCode,
+        role: 'admin',
+        joinedAt: serverTimestamp(),
+        deviceId,
+      });
+
+      // 3. Save locally
+      localStorage.setItem(PHARMACY_ID_KEY, pid);
+      localStorage.setItem(JOIN_CODE_KEY, joinCode);
+
+      // 4. Migrate any existing local data into this newly created pharmacy
+      await this.seedExistingLocalData(pid);
+
+      this.notifyPharmacyChange(pid);
+      this.notifyDataPulled();
+      return { pharmacyId: pid, joinCode };
+    } catch (err: any) {
+      console.error('Error creating pharmacy:', err);
+      const translated = this.translateFirebaseError(err);
+      this.notifyError(`فشل إنشاء الصيدلية: ${translated}`);
+      throw new Error(translated);
+    }
+  }
+
+  /**
+   * Join an existing pharmacy organization using Pharmacy ID & Join Code
+   * Creates members/{uid} with joinCode matching pharmacies/{pid}.joinCode
+   */
+  async joinPharmacy(pharmacyId: string, joinCode: string): Promise<boolean> {
+    const user = await this.ensureAuth();
+    const pid = pharmacyId.trim();
+    const code = joinCode.trim();
+
+    if (!pid || code.length < 8) {
+      throw new Error('يرجى التأكد من إدخال معرّف الصيدلية ورمز الربط المكوّن من 8 خانات على الأقل');
+    }
+
+    const deviceId = this.getDeviceId();
+
+    try {
+      this.updateStatus('syncing');
+
+      // Attempt to register membership. Rules will only allow this if code matches pharmacies/{pid}.joinCode
+      const memberDocRef = doc(db, 'pharmacies', pid, 'members', user.uid);
+      await setDoc(memberDocRef, {
+        joinCode: code,
+        role: 'member',
+        joinedAt: serverTimestamp(),
+        deviceId,
+      });
+
+      // Verification: read pharmacy doc
+      const pharmaSnap = await getDoc(doc(db, 'pharmacies', pid));
+      if (!pharmaSnap.exists()) {
+        throw new Error('لم يتم العثور على الصيدلية المطلوبة');
+      }
+
+      // Save locally
+      localStorage.setItem(PHARMACY_ID_KEY, pid);
+      localStorage.setItem(JOIN_CODE_KEY, code);
+
+      this.notifyPharmacyChange(pid);
+      this.updateStatus('synced');
+      this.notifyDataPulled();
+      return true;
+    } catch (err: any) {
+      console.error('Error joining pharmacy:', err);
+      const translated = this.translateFirebaseError(err);
+      this.notifyError(`فشل ربط الصيدلية: ${translated}`);
+      this.updateStatus('error');
+      throw new Error(translated);
+    }
+  }
+
+  /**
+   * Disconnect this device from the current pharmacy
+   */
+  disconnectPharmacy(): void {
+    try {
+      localStorage.removeItem(PHARMACY_ID_KEY);
+      localStorage.removeItem(JOIN_CODE_KEY);
+      this.notifyPharmacyChange(null);
+      this.notifyDataPulled();
+    } catch (e) {
+      console.warn(e);
+    }
+  }
+
+  // --- Document Operations (Scoped to current pharmacy) ---
+
+  /**
+   * Write or merge document into pharmacies/{pharmacyId}/{collectionName}/{id}
+   * Adds updatedAt (serverTimestamp), deviceId, and deleted: false
+   */
+  async saveDoc(collectionName: string, id: string, data: any): Promise<void> {
+    const pid = this.getPharmacyId();
+    if (!pid) {
+      console.warn(`PharmaCare: saveDoc skipped for ${collectionName}/${id} because no pharmacy is linked`);
+      return;
+    }
+
+    try {
+      const sanitized = JSON.parse(JSON.stringify(data));
+      // Clean non-serializable fields
+      delete sanitized.id;
+
+      const payload = {
+        ...sanitized,
+        id,
+        deleted: false,
+        updatedAt: serverTimestamp(),
+        deviceId: this.getDeviceId(),
+      };
+
+      const docRef = doc(db, 'pharmacies', pid, collectionName, id);
+      // Immediately write via Firestore SDK (writes to IndexedDB persistent cache & syncs to cloud)
+      setDoc(docRef, payload, { merge: true }).catch((err: any) => {
+        console.error(`Firestore write error (${collectionName}/${id}):`, err);
+        this.notifyError(`تعذر حفظ البيانات في السحابة (${collectionName}): ${this.translateFirebaseError(err)}`);
+      });
+
+      this.updatePendingCount();
+    } catch (err: any) {
+      console.error(`Error preparing doc for Firestore (${collectionName}/${id}):`, err);
+      this.notifyError(`خطأ في معالجة البيانات: ${err?.message || err}`);
+    }
+  }
+
+  /**
+   * Soft-delete document (deleted: true) so deletion reliably propagates to all devices
+   */
+  async deleteDoc(collectionName: string, id: string): Promise<void> {
+    const pid = this.getPharmacyId();
+    if (!pid) return;
+
+    try {
+      const docRef = doc(db, 'pharmacies', pid, collectionName, id);
+      setDoc(docRef, {
+        deleted: true,
+        deletedAt: serverTimestamp(),
+        updatedAt: serverTimestamp(),
+        deviceId: this.getDeviceId(),
+      }, { merge: true }).catch((err: any) => {
+        console.error(`Firestore soft delete error (${collectionName}/${id}):`, err);
+        this.notifyError(`تعذر حذف العنصر من السحابة: ${this.translateFirebaseError(err)}`);
+      });
+
+      this.updatePendingCount();
+    } catch (err: any) {
+      console.error(`Error soft-deleting doc (${collectionName}/${id}):`, err);
+      this.notifyError(`خطأ في الحذف: ${err?.message || err}`);
+    }
+  }
+
+  /**
+   * Atomically adjust product stock across devices using increment()
+   */
+  async adjustProductStock(productId: string, deltaQuantity: number): Promise<void> {
+    const pid = this.getPharmacyId();
+    if (!pid) return;
+
+    try {
+      const docRef = doc(db, 'pharmacies', pid, 'products', productId);
+      await updateDoc(docRef, {
+        stock: increment(deltaQuantity),
+        updatedAt: serverTimestamp(),
+        deviceId: this.getDeviceId(),
+      });
+    } catch (err: any) {
+      console.warn(`Atomic stock update failed, fallback to saveDoc:`, err);
+    }
+  }
+
+  // --- Real-Time Subscriptions ---
+
+  /**
+   * Subscribe to collection changes under current pharmacy
+   * Automatically filters out soft-deleted documents
+   */
+  subscribeToCollection<T extends { id: string }>(
+    collectionName: string,
+    callback: (items: T[]) => void
+  ): Unsubscribe {
+    const pid = this.getPharmacyId();
+    if (!pid) {
+      callback([]);
+      // Return dummy unsubscribe
+      return () => {};
+    }
+
+    const colRef = collection(db, 'pharmacies', pid, collectionName);
+    return onSnapshot(
+      colRef,
+      { includeMetadataChanges: false },
+      (snapshot) => {
+        const activeItems: T[] = [];
+        snapshot.docs.forEach((d) => {
+          const data = d.data();
+          if (!data.deleted) {
+            activeItems.push({ id: d.id, ...data } as T);
+          }
+        });
+        callback(activeItems);
+        this.updatePendingCount();
+      },
+      (error) => {
+        console.error(`Firestore ${collectionName} listener error:`, error.code, error.message);
+        this.notifyError(`خطأ في استماع بيانات ${collectionName}: ${this.translateFirebaseError(error)}`);
+      }
+    );
+  }
+
+  // --- Sync Status & Diagnostic Helpers ---
+
+  private updatePendingCount() {
+    if (typeof navigator !== 'undefined' && !navigator.onLine) {
+      this.updateStatus('offline');
+      return;
+    }
+    this.updateStatus('synced');
+  }
+
   onStatusChange(cb: (status: SyncStatus, pendingCount: number, lastSyncTime?: string) => void) {
     this.statusListeners.push(cb);
-    cb(this.currentStatus, this.getQueue().length, this.getLastSyncTime());
+    cb(this.currentStatus, this.pendingCount, this.getLastSyncTime());
     return () => {
       this.statusListeners = this.statusListeners.filter(l => l !== cb);
     };
   }
 
-  // Subscribe to remote data pull events to refresh local React state immediately
   onDataPulled(cb: () => void) {
     this.dataPulledListeners.push(cb);
     return () => {
@@ -162,24 +467,19 @@ class FirebaseSyncService {
 
   notifyDataPulled() {
     this.dataPulledListeners.forEach(cb => {
-      try {
-        cb();
-      } catch (e) {
-        console.warn('Error in onDataPulled listener:', e);
-      }
+      try { cb(); } catch (e) { console.warn(e); }
     });
   }
 
   private updateStatus(status: SyncStatus) {
     this.currentStatus = status;
-    const count = this.getQueue().length;
     const lastSync = this.getLastSyncTime();
-    this.statusListeners.forEach(cb => cb(status, count, lastSync));
+    this.statusListeners.forEach(cb => cb(status, this.pendingCount, lastSync));
   }
 
   getLastSyncTime(): string | undefined {
     try {
-      return localStorage.getItem(this.lastSyncKey) || undefined;
+      return localStorage.getItem(LAST_SYNC_KEY) || undefined;
     } catch {
       return undefined;
     }
@@ -187,471 +487,270 @@ class FirebaseSyncService {
 
   setLastSyncTime(isoTime: string) {
     try {
-      localStorage.setItem(this.lastSyncKey, isoTime);
+      localStorage.setItem(LAST_SYNC_KEY, isoTime);
     } catch {}
   }
 
-  // Validate connection per Firebase skill instructions
-  async testConnection(): Promise<boolean> {
-    try {
-      if (typeof navigator !== 'undefined' && !navigator.onLine) {
-        this.updateStatus('offline');
-        return false;
-      }
-      await getDocFromServer(doc(db, 'settings', 'ping'));
-      this.updateStatus(this.getQueue().length > 0 ? 'syncing' : 'synced');
-      return true;
-    } catch (error) {
-      if (error instanceof Error && error.message.includes('the client is offline')) {
-        this.updateStatus('offline');
-      } else {
-        // Can still be online even if ping doc doesn't exist
-        if (typeof navigator !== 'undefined' && navigator.onLine) {
-          this.updateStatus(this.getQueue().length > 0 ? 'syncing' : 'synced');
-          return true;
-        }
-      }
-      return false;
-    }
-  }
-
-  // Local storage queue
-  getQueue(): SyncQueueItem[] {
-    try {
-      const data = localStorage.getItem(this.queueKey);
-      return data ? JSON.parse(data) : [];
-    } catch {
-      return [];
-    }
-  }
-
-  private saveQueue(queue: SyncQueueItem[]) {
-    try {
-      localStorage.setItem(this.queueKey, JSON.stringify(queue));
-      const isOnline = typeof navigator !== 'undefined' ? navigator.onLine : true;
-      this.updateStatus(queue.length > 0 ? (isOnline ? 'syncing' : 'offline') : 'synced');
-    } catch (e) {
-      console.warn('Failed to save sync queue:', e);
-    }
-  }
-
-  // Queue item with deterministic ID to prevent duplicates
-  enqueue(collectionName: string, id: string, data: any, action: 'set' | 'delete' = 'set') {
-    const queue = this.getQueue();
-    // Replace any existing item for this doc ID to avoid redundant operations
-    const existingIndex = queue.findIndex(q => q.collection === collectionName && q.id === id);
-    const item: SyncQueueItem = {
-      id,
-      collection: collectionName,
-      action,
-      data,
-      timestamp: Date.now(),
+  onError(cb: (message: string) => void) {
+    this.errorListeners.push(cb);
+    return () => {
+      this.errorListeners = this.errorListeners.filter(l => l !== cb);
     };
-
-    if (existingIndex >= 0) {
-      queue[existingIndex] = item;
-    } else {
-      queue.push(item);
-    }
-
-    this.saveQueue(queue);
-
-    // If online, immediately process in background without blocking caller
-    if (typeof navigator !== 'undefined' && navigator.onLine) {
-      this.processQueue();
-    }
   }
 
-  // Process offline sync queue with automatic deduplication & batching
-  async processQueue(): Promise<boolean> {
-    if (this.isProcessing) return false;
+  notifyError(message: string) {
+    this.errorListeners.forEach(cb => {
+      try { cb(message); } catch (e) { console.warn(e); }
+    });
+  }
+
+  /**
+   * "Sync Now" button: Waits for pending local writes to reach cloud and validates connection
+   */
+  async syncNow(): Promise<{ success: boolean; message: string }> {
     if (typeof navigator !== 'undefined' && !navigator.onLine) {
       this.updateStatus('offline');
-      return false;
+      return { success: false, message: 'لا يوجد اتصال بالإنترنت حالياً (البيانات محفوظة محلياً وتُرفع تلقائياً)' };
     }
 
-    const queue = this.getQueue();
-    if (queue.length === 0) {
-      this.updateStatus('synced');
-      return true;
+    const pid = this.getPharmacyId();
+    if (!pid) {
+      return { success: false, message: 'يرجى ربط أو إنشاء صيدلية أولاً لتفعيل المزامنة' };
     }
-
-    this.isProcessing = true;
-    this.updateStatus('syncing');
 
     try {
-      // Process in batches of 25 to respect Firestore transaction limits
-      while (queue.length > 0) {
-        const batchItems = queue.splice(0, 25);
-        const batch = writeBatch(db);
+      this.updateStatus('syncing');
+      // Wait for all offline writes to commit to Firestore
+      await waitForPendingWrites(db);
 
-        for (const item of batchItems) {
-          const docRef = doc(db, item.collection, item.id);
-          if (item.action === 'set' && item.data) {
-            // Remove undefined or prototype values
-            const sanitized = JSON.parse(JSON.stringify(item.data));
-            batch.set(docRef, sanitized, { merge: true });
-          } else if (item.action === 'delete') {
-            batch.delete(docRef);
-          }
-        }
-
-        await batch.commit();
-        this.saveQueue(queue);
-      }
-
-      const now = new Date().toISOString();
-      this.setLastSyncTime(now);
-      this.updateStatus('synced');
-      return true;
-    } catch (err) {
-      handleFirestoreError(err, OperationType.WRITE, 'batch_queue');
-      this.updateStatus('error');
-      return false;
-    } finally {
-      this.isProcessing = false;
-    }
-  }
-
-  // Pull collection from Cloud Firestore
-  async pullCollection<T>(collectionName: string): Promise<T[]> {
-    try {
-      const colRef = collection(db, collectionName);
-      const snapshot = await getDocs(colRef);
-      const items: T[] = [];
-      snapshot.forEach(docSnap => {
-        items.push(docSnap.data() as T);
-      });
-      return items;
-    } catch (err) {
-      handleFirestoreError(err, OperationType.GET, collectionName);
-      return [];
-    }
-  }
-
-  async seedFirestoreIfEmpty(): Promise<void> {
-    if (typeof navigator !== 'undefined' && !navigator.onLine) return;
-    try {
-      const { pharmacyStorage } = await import('./storage');
-      const prodsSnap = await getDocs(collection(db, 'products'));
-      if (prodsSnap.empty) {
-        const localProds = pharmacyStorage.getProducts();
-        if (localProds.length > 0) {
-          for (let i = 0; i < localProds.length; i += 25) {
-            const chunk = localProds.slice(i, i + 25);
-            const batch = writeBatch(db);
-            chunk.forEach(p => batch.set(doc(db, 'products', p.id), JSON.parse(JSON.stringify(p)), { merge: true }));
-            await batch.commit();
-          }
-          console.log('PharmaCare: Seeded', localProds.length, 'products to Firestore');
-        }
-      }
-      const catsSnap = await getDocs(collection(db, 'categories'));
-      if (catsSnap.empty) {
-        const localCats = pharmacyStorage.getCategories();
-        if (localCats.length > 0) {
-          const batch = writeBatch(db);
-          localCats.forEach(c => batch.set(doc(db, 'categories', c.id), JSON.parse(JSON.stringify(c)), { merge: true }));
-          await batch.commit();
-        }
-      }
-    } catch (e) {
-      console.warn('Seed Firestore skipped:', e);
-    }
-  }
-
-  // Perform full two-way synchronization:
-  // 1. Flush local queue (offline changes) to Firestore
-  // 2. Push all local records to ensure Cloud has complete inventory
-  // 3. Pull remote changes from Firestore to local storage
-  async fullTwoWaySync(): Promise<{ success: boolean; pushed: number; pulled: number }> {
-    if (typeof navigator !== 'undefined' && !navigator.onLine) {
-      this.updateStatus('offline');
-      return { success: false, pushed: 0, pulled: 0 };
-    }
-
-    this.updateStatus('syncing');
-    let pushed = 0;
-    let pulled = 0;
-    
-    try {
-      const { pharmacyStorage } = await import('./storage');
-
-      // Step 1: Push offline queued changes first
-      await this.processQueue();
-
-      // Step 2: Push local records to Firestore so both devices share the exact database
-      const prods = pharmacyStorage.getProducts();
-      if (prods.length > 0) {
-        for (let i = 0; i < prods.length; i += 25) {
-          const chunk = prods.slice(i, i + 25);
-          const batch = writeBatch(db);
-          chunk.forEach(p => batch.set(doc(db, 'products', p.id), JSON.parse(JSON.stringify(p)), { merge: true }));
-          await batch.commit();
-          pushed += chunk.length;
-        }
-      }
-
-      const cats = pharmacyStorage.getCategories();
-      if (cats.length > 0) {
-        const catBatch = writeBatch(db);
-        cats.forEach(c => catBatch.set(doc(db, 'categories', c.id), JSON.parse(JSON.stringify(c)), { merge: true }));
-        await catBatch.commit();
-        pushed += cats.length;
-      }
-
-      const custs = pharmacyStorage.getCustomers();
-      if (custs.length > 0) {
-        const custBatch = writeBatch(db);
-        custs.forEach(c => custBatch.set(doc(db, 'customers', c.id), JSON.parse(JSON.stringify(c)), { merge: true }));
-        await custBatch.commit();
-        pushed += custs.length;
-      }
-
-      const sups = pharmacyStorage.getSuppliers();
-      if (sups.length > 0) {
-        const supBatch = writeBatch(db);
-        sups.forEach(s => supBatch.set(doc(db, 'suppliers', s.id), JSON.parse(JSON.stringify(s)), { merge: true }));
-        await supBatch.commit();
-        pushed += sups.length;
-      }
-
-      const invs = pharmacyStorage.getInvoices();
-      if (invs.length > 0) {
-        for (let i = 0; i < invs.length; i += 25) {
-          const chunk = invs.slice(i, i + 25);
-          const batch = writeBatch(db);
-          chunk.forEach(inv => batch.set(doc(db, 'invoices', inv.id), JSON.parse(JSON.stringify(inv)), { merge: true }));
-          await batch.commit();
-          pushed += chunk.length;
-        }
-      }
-
-      // Step 3: Pull products
-      const cloudProducts = await this.pullCollection<any>('products');
-      if (cloudProducts.length > 0) {
-        pharmacyStorage.mergeRemoteProducts(cloudProducts);
-        pulled += cloudProducts.length;
-      }
-
-      // Pull categories
-      const cloudCategories = await this.pullCollection<any>('categories');
-      if (cloudCategories.length > 0) {
-        pharmacyStorage.mergeRemoteCategories(cloudCategories);
-        pulled += cloudCategories.length;
-      }
-
-      // Pull invoices
-      const cloudInvoices = await this.pullCollection<any>('invoices');
-      if (cloudInvoices.length > 0) {
-        pharmacyStorage.mergeRemoteInvoices(cloudInvoices);
-        pulled += cloudInvoices.length;
-      }
-
-      // Pull customers
-      const cloudCustomers = await this.pullCollection<any>('customers');
-      if (cloudCustomers.length > 0) {
-        pharmacyStorage.mergeRemoteCustomers(cloudCustomers);
-        pulled += cloudCustomers.length;
-      }
-
-      // Pull suppliers
-      const cloudSuppliers = await this.pullCollection<any>('suppliers');
-      if (cloudSuppliers.length > 0) {
-        pharmacyStorage.mergeRemoteSuppliers(cloudSuppliers);
-        pulled += cloudSuppliers.length;
-      }
-
-      // Pull purchases
-      const cloudPurchases = await this.pullCollection<any>('purchases');
-      if (cloudPurchases.length > 0) {
-        pharmacyStorage.mergeRemotePurchases(cloudPurchases);
-        pulled += cloudPurchases.length;
-      }
-
-      // Pull vouchers
-      const cloudVouchers = await this.pullCollection<any>('vouchers');
-      if (cloudVouchers.length > 0) {
-        pharmacyStorage.mergeRemoteVouchers(cloudVouchers);
-        pulled += cloudVouchers.length;
-      }
+      // Validate live connection
+      await getDocFromServer(doc(db, 'pharmacies', pid));
 
       const now = new Date().toISOString();
       this.setLastSyncTime(now);
       this.updateStatus('synced');
       this.notifyDataPulled();
-      return { success: true, pushed, pulled };
-    } catch (e) {
-      console.warn('Two-way sync pull error:', e);
+      return { success: true, message: 'تم التحقق من المزامنة: جميع البيانات متطابقة ومتزامنة لحظياً عبر السحابة 🟢' };
+    } catch (err: any) {
+      console.warn('Sync now error:', err);
       this.updateStatus('error');
-      return { success: false, pushed, pulled };
+      const translated = this.translateFirebaseError(err);
+      return { success: false, message: `تعذر إتمام المزامنة: ${translated}` };
     }
   }
 
   /**
-   * Save a complete snapshot backup directly to Firestore /backups collection
-   * Runs silently in the background without triggering any browser downloads.
+   * Run full diagnostics test: writes and reads a test document and explains errors in Arabic
    */
-  async saveCloudSnapshotBackup(isAutomatic: boolean = false): Promise<{ success: boolean; id?: string }> {
+  async runDiagnosticTest(): Promise<{ success: boolean; message: string; details: any }> {
+    const isOnline = typeof navigator !== 'undefined' ? navigator.onLine : true;
+    if (!isOnline) {
+      return {
+        success: false,
+        message: 'الجهاز غير متصل بالإنترنت. يرجى تفعيل Wi-Fi أو البيانات.',
+        details: { code: 'offline' }
+      };
+    }
+
+    const pid = this.getPharmacyId();
+    if (!pid) {
+      return {
+        success: false,
+        message: 'لم يتم ربط هذا الجهاز بأي صيدلية بعد. يرجى إنشاء صيدلية أو ربطها بالرمز أولاً.',
+        details: { code: 'no_pharmacy' }
+      };
+    }
+
+    try {
+      const user = await this.ensureAuth();
+      const testDocRef = doc(db, 'pharmacies', pid, 'settings', 'test_ping');
+      const testTimestamp = Date.now().toString();
+
+      // Write test
+      await setDoc(testDocRef, {
+        testPing: testTimestamp,
+        testerUid: user.uid,
+        deviceId: this.getDeviceId(),
+        testedAt: serverTimestamp()
+      }, { merge: true });
+
+      // Read test from server
+      const readSnap = await getDocFromServer(testDocRef);
+      if (!readSnap.exists()) {
+        throw new Error('لم يتمكن الاختبار من قراءة مستند التحقق');
+      }
+
+      return {
+        success: true,
+        message: 'الاتصال ممتاز بقاعدة Firestore وقواعد الحماية تعمل بشكل صحيح 🟢',
+        details: {
+          uid: user.uid,
+          isAnonymous: user.isAnonymous,
+          pharmacyId: pid,
+          pingTime: readSnap.data()?.testPing
+        }
+      };
+    } catch (err: any) {
+      console.error('Diagnostic error:', err);
+      const message = this.translateFirebaseError(err);
+      return {
+        success: false,
+        message: `فشل اختبار الاتصال: ${message}`,
+        details: {
+          code: err?.code || 'unknown',
+          originalMessage: err?.message
+        }
+      };
+    }
+  }
+
+  /**
+   * Translate Firebase technical error codes to clear Arabic explanations
+   */
+  translateFirebaseError(err: any): string {
+    const code = err?.code || '';
+    const message = err?.message || String(err);
+
+    if (code === 'permission-denied' || message.includes('PERMISSION_DENIED')) {
+      return 'تم رفض الإذن (permission-denied): يرجى التأكد من نشر ملف firestore.rules في Firebase Console وتفعيل خيار Anonymous Authentication في Authentication > Sign-in method.';
+    }
+    if (code === 'not-found' || message.includes('NOT_FOUND')) {
+      return 'قاعدة البيانات غير موجودة (not-found): يرجى التأكد من إنشاء قاعدة Firestore بالمعرّف (default) في Firebase Console.';
+    }
+    if (code === 'unavailable' || message.includes('unavailable') || message.includes('Failed to get document')) {
+      return 'خدمة السحابة غير متاحة حالياً (unavailable): يرجى التأكد من استقرار الإنترنت أو فحص الحجب.';
+    }
+    if (code === 'auth/unauthorized-domain' || message.includes('unauthorized-domain')) {
+      const domain = typeof window !== 'undefined' ? window.location.hostname : 'النطاق الحالي';
+      return `النطاق (${domain}) غير مصرح به: يرجى إضافته في قائمة Authorized Domains داخل Firebase Console > Authentication > Settings.`;
+    }
+    if (code === 'auth/network-request-failed') {
+      return 'فشل الاتصال بالشبكة أثناء المصادقة السحابية.';
+    }
+    if (message.includes('joinCode')) {
+      return 'رمز الانضمام (Join Code) غير صحيح أو لا يطابق هذه الصيدلية.';
+    }
+    return message || 'خطأ غير معروف في خدمة المزامنة السحابية';
+  }
+
+  /**
+   * Seed existing local data into newly created pharmacy to prevent any data loss
+   */
+  private async seedExistingLocalData(pid: string): Promise<void> {
     try {
       const { pharmacyStorage } = await import('./storage');
-      const backupJson = pharmacyStorage.exportAllDataJSON();
-      const backupId = `backup_${Date.now()}`;
-      const docRef = doc(db, 'backups', backupId);
-      await setDoc(docRef, {
-        id: backupId,
-        timestamp: new Date().toISOString(),
-        type: isAutomatic ? 'auto' : 'manual',
-        data: backupJson,
-        size: `${(backupJson.length / 1024).toFixed(1)} KB`,
-      });
-      return { success: true, id: backupId };
-    } catch (err) {
-      console.warn('Cloud snapshot backup to Firestore failed silently:', err);
-      return { success: false };
+      const prods = pharmacyStorage.getProducts();
+      const cats = pharmacyStorage.getCategories();
+      const mans = pharmacyStorage.getManufacturers();
+      const ings = pharmacyStorage.getIngredients();
+      const custs = pharmacyStorage.getCustomers();
+      const sups = pharmacyStorage.getSuppliers();
+      const invs = pharmacyStorage.getInvoices();
+      const purs = pharmacyStorage.getPurchases();
+      const vouchs = pharmacyStorage.getVouchers();
+      const banks = pharmacyStorage.getBanks();
+      const settings = pharmacyStorage.getSettings();
+
+      // Write items in small non-blocking chunks
+      for (const p of prods) {
+        await this.saveDoc('products', p.id, p);
+      }
+      for (const c of cats) {
+        await this.saveDoc('categories', c.id, c);
+      }
+      for (const m of mans) {
+        await this.saveDoc('manufacturers', m.id, m);
+      }
+      for (const i of ings) {
+        await this.saveDoc('ingredients', i.id, i);
+      }
+      for (const cust of custs) {
+        await this.saveDoc('customers', cust.id, cust);
+      }
+      for (const sup of sups) {
+        await this.saveDoc('suppliers', sup.id, sup);
+      }
+      for (const inv of invs) {
+        await this.saveDoc('invoices', inv.id, inv);
+      }
+      for (const pur of purs) {
+        await this.saveDoc('purchases', pur.id, pur);
+      }
+      for (const v of vouchs) {
+        await this.saveDoc('vouchers', v.id, v);
+      }
+      for (const b of banks) {
+        await this.saveDoc('banks', b.id, b);
+      }
+      await this.saveDoc('settings', 'current', settings);
+
+      console.log('PharmaCare: Successfully seeded local data to new pharmacy:', pid);
+    } catch (e) {
+      console.warn('PharmaCare: Data seed warning:', e);
     }
   }
 }
 
 export const firebaseSync = new FirebaseSyncService();
 
-/**
- * Direct CRUD operations using Firestore SDK directly with automatic offline queue fallback
- */
-export async function saveDocToFirestore(collectionName: string, id: string, data: any): Promise<void> {
-  try {
-    const sanitized = JSON.parse(JSON.stringify(data));
-    const docRef = doc(db, collectionName, id);
-    await setDoc(docRef, sanitized, { merge: true });
-  } catch (error) {
-    console.warn(`Firestore direct write failed for ${collectionName}/${id}:`, error);
-    firebaseSync.enqueue(collectionName, id, data, 'set');
-  }
-}
+// --- Typed Collection Subscriptions ---
 
-export async function deleteDocFromFirestore(collectionName: string, id: string): Promise<void> {
-  try {
-    const docRef = doc(db, collectionName, id);
-    await deleteDoc(docRef);
-  } catch (error) {
-    console.warn(`Firestore direct delete failed for ${collectionName}/${id}:`, error);
-    firebaseSync.enqueue(collectionName, id, null, 'delete');
-  }
-}
-
-/**
- * Real-Time onSnapshot subscriptions across devices
- */
 export function subscribeToProducts(callback: (products: Product[]) => void): Unsubscribe {
-  return onSnapshot(
-    collection(db, 'products'),
-    { includeMetadataChanges: false },
-    (snapshot) => {
-      if (!snapshot.empty) {
-        const products = snapshot.docs.map(d => ({ id: d.id, ...d.data() } as Product));
-        callback(products);
-      }
-    },
-    (error) => {
-      console.error('Firestore products listener error:', error.code, error.message);
-    }
-  );
+  return firebaseSync.subscribeToCollection<Product>('products', callback);
 }
 
 export function subscribeToCategories(callback: (categories: Category[]) => void): Unsubscribe {
-  return onSnapshot(
-    collection(db, 'categories'),
-    { includeMetadataChanges: false },
-    (snapshot) => {
-      if (!snapshot.empty) {
-        const categories = snapshot.docs.map(d => ({ id: d.id, ...d.data() } as Category));
-        callback(categories);
-      }
-    },
-    (error) => {
-      console.error('Firestore categories listener error:', error.code, error.message);
-    }
-  );
+  return firebaseSync.subscribeToCollection<Category>('categories', callback);
+}
+
+export function subscribeToManufacturers(callback: (manufacturers: Manufacturer[]) => void): Unsubscribe {
+  return firebaseSync.subscribeToCollection<Manufacturer>('manufacturers', callback);
+}
+
+export function subscribeToIngredients(callback: (ingredients: Ingredient[]) => void): Unsubscribe {
+  return firebaseSync.subscribeToCollection<Ingredient>('ingredients', callback);
 }
 
 export function subscribeToInvoices(callback: (invoices: Invoice[]) => void): Unsubscribe {
-  return onSnapshot(
-    collection(db, 'invoices'),
-    { includeMetadataChanges: false },
-    (snapshot) => {
-      if (!snapshot.empty) {
-        const invoices = snapshot.docs.map(d => ({ id: d.id, ...d.data() } as Invoice));
-        callback(invoices);
-      }
-    },
-    (error) => {
-      console.error('Firestore invoices listener error:', error.code, error.message);
-    }
-  );
+  return firebaseSync.subscribeToCollection<Invoice>('invoices', callback);
 }
 
 export function subscribeToCustomers(callback: (customers: Customer[]) => void): Unsubscribe {
-  return onSnapshot(
-    collection(db, 'customers'),
-    { includeMetadataChanges: false },
-    (snapshot) => {
-      if (!snapshot.empty) {
-        const customers = snapshot.docs.map(d => ({ id: d.id, ...d.data() } as Customer));
-        callback(customers);
-      }
-    },
-    (error) => {
-      console.error('Firestore customers listener error:', error.code, error.message);
-    }
-  );
+  return firebaseSync.subscribeToCollection<Customer>('customers', callback);
 }
 
 export function subscribeToSuppliers(callback: (suppliers: Supplier[]) => void): Unsubscribe {
-  return onSnapshot(
-    collection(db, 'suppliers'),
-    { includeMetadataChanges: false },
-    (snapshot) => {
-      if (!snapshot.empty) {
-        const suppliers = snapshot.docs.map(d => ({ id: d.id, ...d.data() } as Supplier));
-        callback(suppliers);
-      }
-    },
-    (error) => {
-      console.error('Firestore suppliers listener error:', error.code, error.message);
-    }
-  );
+  return firebaseSync.subscribeToCollection<Supplier>('suppliers', callback);
 }
 
 export function subscribeToPurchases(callback: (purchases: Purchase[]) => void): Unsubscribe {
-  return onSnapshot(collection(db, 'purchases'), (snapshot) => {
-    if (!snapshot.empty) {
-      const purchases = snapshot.docs.map(doc => ({ id: doc.id, ...doc.data() } as Purchase));
-      callback(purchases);
-    }
-  }, (error) => {
-    console.error('Firestore purchases real-time sync error:', error);
-  });
+  return firebaseSync.subscribeToCollection<Purchase>('purchases', callback);
 }
 
 export function subscribeToVouchers(callback: (vouchers: Voucher[]) => void): Unsubscribe {
-  return onSnapshot(collection(db, 'vouchers'), (snapshot) => {
-    if (!snapshot.empty) {
-      const vouchers = snapshot.docs.map(doc => ({ id: doc.id, ...doc.data() } as Voucher));
-      callback(vouchers);
-    }
-  }, (error) => {
-    console.error('Firestore vouchers real-time sync error:', error);
-  });
+  return firebaseSync.subscribeToCollection<Voucher>('vouchers', callback);
 }
 
 export function subscribeToBanks(callback: (banks: Bank[]) => void): Unsubscribe {
-  return onSnapshot(collection(db, 'banks'), (snapshot) => {
-    if (!snapshot.empty) {
-      const banks = snapshot.docs.map(doc => ({ id: doc.id, ...doc.data() } as Bank));
-      callback(banks);
-    }
-  }, (error) => {
-    console.error('Firestore banks real-time sync error:', error);
-  });
+  return firebaseSync.subscribeToCollection<Bank>('banks', callback);
 }
 
+export function subscribeToStockMovements(callback: (movements: StockMovement[]) => void): Unsubscribe {
+  return firebaseSync.subscribeToCollection<StockMovement>('stockMovements', callback);
+}
+
+export function subscribeToSettings(callback: (settings: Settings) => void): Unsubscribe {
+  const pid = firebaseSync.getPharmacyId();
+  if (!pid) return () => {};
+  return onSnapshot(
+    doc(db, 'pharmacies', pid, 'settings', 'current'),
+    (docSnap) => {
+      if (docSnap.exists()) {
+        callback(docSnap.data() as Settings);
+      }
+    },
+    (error) => {
+      console.warn('Firestore settings listener error:', error);
+    }
+  );
+}

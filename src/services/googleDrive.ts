@@ -1,57 +1,16 @@
 /**
- * Google Drive Backup Service for PharmaCare Plus
- * Handles daily automated backups and manual backups/restores via Google Drive API v3
+ * PharmaCare Plus - Google Drive Backup Service via Google Apps Script Web App
+ * Features:
+ * - Zero Google Login required for users on client devices
+ * - Uses Google Apps Script Web App as a secure proxy to Google Drive
+ * - Web App URL and Secret Token stored in pharmacy settings and synced to all devices
+ * - Direct POST with Content-Type: text/plain to prevent CORS preflight
+ * - 30-second timeout via AbortController with 3 exponential backoff retries
+ * - Automated background scheduling (every 24h on start, every 6h active)
  */
 
-import { GoogleAuthProvider, signInWithPopup, User, onAuthStateChanged, signOut } from 'firebase/auth';
-import { auth, firebaseSync } from './firebaseSync';
 import { pharmacyStorage } from './storage';
-
-const SCOPES = ['https://www.googleapis.com/auth/drive.file'];
-const BACKUP_FOLDER_NAME = 'PharmaCare_Backups';
-const LAST_BACKUP_DATE_KEY = 'pharmacare_last_drive_backup_date';
-const TOKEN_KEY = 'pharmacare_drive_access_token';
-const TOKEN_EXPIRY_KEY = 'pharmacare_drive_token_expiry';
-const USER_EMAIL_KEY = 'pharmacare_drive_user_email';
-
-// Token caching with session & local storage fallback so page refreshes don't lose connection
-let cachedAccessToken: string | null = null;
-let isSigningIn = false;
-
-export function getDriveAccessToken(): string | null {
-  if (cachedAccessToken) return cachedAccessToken;
-  try {
-    const saved = localStorage.getItem(TOKEN_KEY) || sessionStorage.getItem(TOKEN_KEY);
-    const expiry = localStorage.getItem(TOKEN_EXPIRY_KEY) || sessionStorage.getItem(TOKEN_EXPIRY_KEY);
-    if (saved && expiry && Date.now() < parseInt(expiry, 10)) {
-      cachedAccessToken = saved;
-      return saved;
-    }
-  } catch (e) {}
-  return null;
-}
-
-export function setStoredAccessToken(token: string, expiresInSeconds: number = 3600) {
-  cachedAccessToken = token;
-  const expiry = Date.now() + (expiresInSeconds - 120) * 1000;
-  try {
-    localStorage.setItem(TOKEN_KEY, token);
-    localStorage.setItem(TOKEN_EXPIRY_KEY, expiry.toString());
-    sessionStorage.setItem(TOKEN_KEY, token);
-    sessionStorage.setItem(TOKEN_EXPIRY_KEY, expiry.toString());
-  } catch (e) {}
-}
-
-export function clearStoredAccessToken() {
-  cachedAccessToken = null;
-  try {
-    localStorage.removeItem(TOKEN_KEY);
-    localStorage.removeItem(TOKEN_EXPIRY_KEY);
-    localStorage.removeItem(USER_EMAIL_KEY);
-    sessionStorage.removeItem(TOKEN_KEY);
-    sessionStorage.removeItem(TOKEN_EXPIRY_KEY);
-  } catch (e) {}
-}
+import { firebaseSync } from './firebaseSync';
 
 export interface DriveBackupFile {
   id: string;
@@ -61,468 +20,299 @@ export interface DriveBackupFile {
   description?: string;
 }
 
-export interface DriveAuthState {
-  isAuthenticated: boolean;
-  user: User | null;
-  hasDriveAccess: boolean;
-}
+const LAST_BACKUP_DATE_KEY = 'pharmacare_last_drive_backup_date';
+const LAST_BACKUP_TIMESTAMP_KEY = 'pharmacare_last_drive_backup_timestamp';
 
-type AuthListener = (state: DriveAuthState) => void;
-const authListeners: AuthListener[] = [];
-
-// Initialize Auth state
-export function initDriveAuth(listener: AuthListener): () => void {
-  authListeners.push(listener);
-  
-  // Emit initial state immediately
-  const token = getDriveAccessToken();
-  listener({
-    isAuthenticated: !!auth.currentUser,
-    user: auth.currentUser,
-    hasDriveAccess: !!token,
-  });
-
-  const unsubscribe = onAuthStateChanged(auth, (user) => {
-    const currentToken = getDriveAccessToken();
-    const state: DriveAuthState = {
-      isAuthenticated: !!user,
-      user,
-      hasDriveAccess: !!currentToken,
-    };
-    listener(state);
-  });
-
-  return () => {
-    const idx = authListeners.indexOf(listener);
-    if (idx >= 0) authListeners.splice(idx, 1);
-    unsubscribe();
-  };
-}
-
-function notifyAuthListeners(user: User | null) {
-  const currentToken = getDriveAccessToken();
-  const state: DriveAuthState = {
-    isAuthenticated: !!user,
-    user,
-    hasDriveAccess: !!currentToken,
-  };
-  authListeners.forEach((l) => l(state));
-}
-
-/**
- * Sign in with Google requesting Google Drive scope
- * Includes 10-second timeout fallback for environments with unregistered redirect URIs (e.g. GitHub Pages)
- */
-export async function signInWithGoogleDrive(): Promise<{ user: User; accessToken: string }> {
+// Helper for abortable fetch with timeout
+async function fetchWithTimeout(url: string, options: RequestInit = {}, timeoutMs = 30000): Promise<Response> {
+  const controller = new AbortController();
+  const id = setTimeout(() => controller.abort(), timeoutMs);
   try {
-    isSigningIn = true;
-    const provider = new GoogleAuthProvider();
-    SCOPES.forEach((scope) => provider.addScope(scope));
-    provider.setCustomParameters({
-      prompt: 'select_account',
+    const response = await fetch(url, {
+      ...options,
+      signal: controller.signal,
     });
-
-    const timeoutPromise = new Promise<never>((_, reject) => {
-      setTimeout(() => {
-        reject(new Error('تعذّر الاتصال بـ Google Drive. تأكد من أنك تشغّل التطبيق من بيئة AI Studio، أو راجع إعدادات OAuth.'));
-      }, 10000);
-    });
-
-    let result;
-    try {
-      result = await Promise.race([
-        signInWithPopup(auth, provider),
-        timeoutPromise
-      ]);
-    } catch (popupErr: any) {
-      if (popupErr?.code === 'auth/cancelled-popup-request' || popupErr?.code === 'auth/popup-closed-by-user') {
-        throw popupErr;
-      }
-      if (popupErr?.message && popupErr.message.includes('تعذّر الاتصال بـ Google Drive')) {
-        throw popupErr;
-      }
-      if (popupErr?.code === 'auth/unauthorized-domain') {
-        throw new Error('تعذّر الاتصال بـ Google Drive. تأكد من أنك تشغّل التطبيق من بيئة AI Studio، أو راجع إعدادات OAuth.');
-      }
-      // If error occurred with stale session, sign out cleanly and retry once with timeout
-      await signOut(auth);
-      clearStoredAccessToken();
-      result = await Promise.race([
-        signInWithPopup(auth, provider),
-        timeoutPromise
-      ]);
-    }
-
-    const credential = GoogleAuthProvider.credentialFromResult(result);
-    const token = credential?.accessToken;
-    
-    if (!token) {
-      throw new Error('لم نتمكن من الحصول على تصريح الوصول إلى Google Drive من المصادقة');
-    }
-
-    setStoredAccessToken(token);
-    try {
-      if (result.user?.email) {
-        localStorage.setItem(USER_EMAIL_KEY, result.user.email);
-      }
-    } catch {}
-    
-    notifyAuthListeners(result.user);
-    
-    return { user: result.user, accessToken: token };
+    return response;
   } catch (err: any) {
-    console.error('Sign-in error with Google Drive scope:', err);
-    if (err?.code === 'auth/unauthorized-domain' || (err?.message && err.message.includes('network-request-failed'))) {
-      throw new Error('تعذّر الاتصال بـ Google Drive. تأكد من أنك تشغّل التطبيق من بيئة AI Studio، أو راجع إعدادات OAuth.');
+    if (err.name === 'AbortError') {
+      throw new Error(`انتهت مهلة انتظار خادم Google Drive (${Math.round(timeoutMs / 1000)} ثانية). تأكد من استقرار الإنترنت.`);
     }
     throw err;
   } finally {
-    isSigningIn = false;
+    clearTimeout(id);
   }
 }
 
-/**
- * Sign out from Google Drive
- */
-export async function signOutFromDrive(): Promise<void> {
-  clearStoredAccessToken();
-  await signOut(auth);
-  notifyAuthListeners(null);
+// Retry fetch helper with exponential backoff
+async function fetchWithRetry(url: string, options: RequestInit = {}, retries = 3, delayMs = 1500): Promise<Response> {
+  let lastError: any;
+  for (let attempt = 1; attempt <= retries; attempt++) {
+    try {
+      const response = await fetchWithTimeout(url, options, 30000);
+      if (response.ok) return response;
+      // If server returned error, check status
+      const errorText = await response.text();
+      lastError = new Error(`استجابة غير صحيحة من الخادم (${response.status}): ${errorText}`);
+    } catch (err) {
+      lastError = err;
+    }
+    if (attempt < retries) {
+      console.warn(`PharmaCare Backup: Attempt ${attempt} failed, retrying in ${delayMs * attempt}ms...`);
+      await new Promise(r => setTimeout(r, delayMs * attempt));
+    }
+  }
+  throw lastError;
 }
 
 /**
- * Find or create the PharmaCare_Backups folder on Google Drive
+ * Upload pharmacy database backup directly to Google Drive via Google Apps Script Web App
  */
-async function getOrCreateBackupsFolder(token: string): Promise<string> {
-  // 1. Search for existing folder
-  const query = encodeURIComponent(`name = '${BACKUP_FOLDER_NAME}' and mimeType = 'application/vnd.google-apps.folder' and trashed = false`);
-  const searchRes = await fetch(`https://www.googleapis.com/drive/v3/files?q=${query}&fields=files(id,name)&spaces=drive`, {
-    headers: { Authorization: `Bearer ${token}` },
-  });
+export async function uploadBackupToDrive(
+  isAutomatic = false,
+  onProgress?: (progressMessage: string) => void
+): Promise<{ success: boolean; fileName: string; fileId?: string }> {
+  const settings = pharmacyStorage.getSettings();
+  const webAppUrl = settings.googleWebAppUrl?.trim();
+  const backupToken = settings.backupToken?.trim();
 
-  if (!searchRes.ok) {
-    const errText = await searchRes.text();
-    throw new Error(`فشل البحث عن مجلد النسخ الاحتياطي في درايف: ${errText}`);
-  }
-
-  const searchData = await searchRes.json();
-  if (searchData.files && searchData.files.length > 0) {
-    return searchData.files[0].id;
-  }
-
-  // 2. Folder not found, create it
-  const createRes = await fetch('https://www.googleapis.com/drive/v3/files', {
-    method: 'POST',
-    headers: {
-      Authorization: `Bearer ${token}`,
-      'Content-Type': 'application/json',
-    },
-    body: JSON.stringify({
-      name: BACKUP_FOLDER_NAME,
-      mimeType: 'application/vnd.google-apps.folder',
-      description: 'مجلد النسخ الاحتياطي التلقائي لنظام فارماكير بلس لإدارة الصيدليات',
-    }),
-  });
-
-  if (!createRes.ok) {
-    const errText = await createRes.text();
-    throw new Error(`فشل إنشاء مجلد النسخ الاحتياطي في درايف: ${errText}`);
-  }
-
-  const folderData = await createRes.json();
-  return folderData.id;
-}
-
-/**
- * Perform backup to Google Drive
- */
-export async function uploadBackupToDrive(isAutomatic = false): Promise<DriveBackupFile> {
-  let token = getDriveAccessToken();
-  if (!token) {
-    // If not in memory and user triggers manual, prompt login
+  if (!webAppUrl || !backupToken) {
+    const errorMsg = 'لم يتم ضبط رابط Google Apps Script Web App أو رمز الأمان (Token) في إعدادات النسخ الاحتياطي.';
     if (!isAutomatic) {
-      const authResult = await signInWithGoogleDrive();
-      token = authResult.accessToken;
+      throw new Error(errorMsg);
     } else {
-      throw new Error('يرجى ربط حساب Google أولاً لتفعيل النسخ الاحتياطي التلقائي');
+      console.warn('Auto Drive backup skipped:', errorMsg);
+      return { success: false, fileName: '' };
     }
   }
 
-  const folderId = await getOrCreateBackupsFolder(token);
-  const now = new Date();
-  const dateFormatted = now.toISOString().split('T')[0];
-  const timeFormatted = now.toTimeString().split(' ')[0].replace(/:/g, '-');
-  const fileName = `pharmacare_backup_${dateFormatted}_${timeFormatted}.json`;
+  onProgress?.('جاري استخراج وتجميع بيانات الصيدلية بالكامل...');
+  const backupData = pharmacyStorage.exportAllDataJSON();
+  const pharmacyId = firebaseSync.getPharmacyId() || 'default';
 
-  // Get full database JSON payload
-  const backupJson = pharmacyStorage.exportAllDataJSON();
+  onProgress?.('جاري الاتصال بخدمة Google Drive Web App...');
 
-  // Create multipart body
-  const metadata = {
-    name: fileName,
-    parents: [folderId],
-    mimeType: 'application/json',
-    description: `نسخة احتياطية ${isAutomatic ? 'تلقائية يومية' : 'يدوية'} لقاعدة بيانات الصيدلية - ${now.toLocaleString('ar-EG')}`,
+  const payload = {
+    token: backupToken,
+    pharmacyId: pharmacyId,
+    data: backupData,
+    timestamp: Date.now()
   };
 
-  const boundary = '-------314159265358979323846';
-  const delimiter = `\r\n--${boundary}\r\n`;
-  const closeDelimiter = `\r\n--${boundary}--`;
+  onProgress?.('جاري رفع وحفظ ملف النسخة الاحتياطية في مجلد PharmaCare_Backups...');
 
-  const multipartRequestBody =
-    delimiter +
-    'Content-Type: application/json; charset=UTF-8\r\n\r\n' +
-    JSON.stringify(metadata) +
-    delimiter +
-    'Content-Type: application/json\r\n\r\n' +
-    backupJson +
-    closeDelimiter;
-
-  const uploadRes = await fetch('https://www.googleapis.com/upload/drive/v3/files?uploadType=multipart', {
+  // Use Content-Type: text/plain to avoid CORS preflight options check
+  const response = await fetchWithRetry(webAppUrl, {
     method: 'POST',
     headers: {
-      Authorization: `Bearer ${token}`,
-      'Content-Type': `multipart/related; boundary=${boundary}`,
+      'Content-Type': 'text/plain;charset=utf-8'
     },
-    body: multipartRequestBody,
-  });
+    body: JSON.stringify(payload)
+  }, 3, 2000);
 
-  if (uploadRes.status === 401) {
-    clearStoredAccessToken();
-    notifyAuthListeners(auth.currentUser);
-    throw new Error('انتهت صلاحية جلسة Google Drive، يرجى النقر على زر تسجيل الدخول لتجديد الاتصال');
+  const result = await response.json();
+
+  if (!result.success) {
+    throw new Error(result.error || 'فشل حفظ النسخة في Google Drive');
   }
 
-  if (!uploadRes.ok) {
-    const errText = await uploadRes.text();
-    throw new Error(`فشل رفع ملف النسخة الاحتياطية إلى Google Drive: ${errText}`);
-  }
+  const now = new Date();
+  const today = now.toISOString().split('T')[0];
 
-  const fileData = await uploadRes.json();
+  // Update timestamps
+  try {
+    localStorage.setItem(LAST_BACKUP_DATE_KEY, today);
+    localStorage.setItem(LAST_BACKUP_TIMESTAMP_KEY, now.getTime().toString());
+  } catch {}
 
-  // Save last backup timestamp and mark today as backed up
-  localStorage.setItem(LAST_BACKUP_DATE_KEY, dateFormatted);
-  const settings = pharmacyStorage.getSettings();
-  pharmacyStorage.saveSettings({
+  const updatedSettings = {
     ...settings,
     lastDriveBackupTime: now.toISOString(),
-    lastDriveBackupFileName: fileName,
-    lastDriveBackupStatus: 'success',
-  });
+    lastDriveBackupFileName: result.fileName,
+    lastDriveBackupStatus: 'success' as const
+  };
+  pharmacyStorage.saveSettings(updatedSettings);
 
+  onProgress?.('اكتمل حفظ النسخة في Google Drive بنجاح! ☁️');
   return {
-    id: fileData.id,
-    name: fileName,
-    createdTime: now.toISOString(),
-    description: metadata.description,
+    success: true,
+    fileName: result.fileName,
+    fileId: result.fileId
   };
 }
 
 /**
- * List existing backups from Google Drive
+ * List available backups from Google Drive Web App
  */
 export async function listDriveBackups(): Promise<DriveBackupFile[]> {
-  const token = getDriveAccessToken();
-  if (!token) return [];
+  const settings = pharmacyStorage.getSettings();
+  const webAppUrl = settings.googleWebAppUrl?.trim();
+  const backupToken = settings.backupToken?.trim();
+
+  if (!webAppUrl || !backupToken) {
+    return [];
+  }
 
   try {
-    const folderId = await getOrCreateBackupsFolder(token);
-    const query = encodeURIComponent(`'${folderId}' in parents and trashed = false`);
-    const res = await fetch(`https://www.googleapis.com/drive/v3/files?q=${query}&orderBy=createdTime desc&pageSize=20&fields=files(id,name,size,createdTime,description)`, {
-      headers: { Authorization: `Bearer ${token}` },
-    });
+    const separator = webAppUrl.includes('?') ? '&' : '?';
+    const targetUrl = `${webAppUrl}${separator}action=list&token=${encodeURIComponent(backupToken)}`;
 
-    if (res.status === 401) {
-      clearStoredAccessToken();
-      notifyAuthListeners(auth.currentUser);
-      return [];
+    const response = await fetchWithTimeout(targetUrl, { method: 'GET' }, 20000);
+    if (!response.ok) {
+      throw new Error(`خطأ في استرجاع القائمة (${response.status})`);
     }
 
-    if (!res.ok) {
-      console.warn('Failed to list drive files:', await res.text());
-      return [];
+    const result = await response.json();
+    if (!result.success) {
+      throw new Error(result.error || 'فشل استرجاع قائمة النسخ الاحتياطية');
     }
 
-    const data = await res.json();
-    return (data.files || []).map((f: any) => ({
+    return (result.files || []).map((f: any) => ({
       id: f.id,
       name: f.name,
-      size: f.size ? `${(parseInt(f.size, 10) / 1024).toFixed(1)} KB` : 'غير محدد',
+      size: f.size || 'غير محدد',
       createdTime: f.createdTime,
-      description: f.description,
+      description: f.description || ''
     }));
   } catch (err) {
-    console.warn('Error fetching drive backups list:', err);
-    return [];
+    console.warn('PharmaCare: Failed to list drive backups:', err);
+    throw err;
   }
 }
 
 /**
- * Download and restore backup content from Google Drive
+ * Download a backup file from Google Drive and restore local state
  */
 export async function downloadAndRestoreBackup(fileId: string): Promise<boolean> {
-  const token = getDriveAccessToken();
-  if (!token) {
-    throw new Error('غير مصرح بالوصول إلى Google Drive');
+  const settings = pharmacyStorage.getSettings();
+  const webAppUrl = settings.googleWebAppUrl?.trim();
+  const backupToken = settings.backupToken?.trim();
+
+  if (!webAppUrl || !backupToken) {
+    throw new Error('رابط Web App أو رمز الأمان غير محدد في الإعدادات');
   }
 
-  const res = await fetch(`https://www.googleapis.com/drive/v3/files/${fileId}?alt=media`, {
-    headers: { Authorization: `Bearer ${token}` },
-  });
+  const separator = webAppUrl.includes('?') ? '&' : '?';
+  const targetUrl = `${webAppUrl}${separator}action=download&fileId=${encodeURIComponent(fileId)}&token=${encodeURIComponent(backupToken)}`;
 
-  if (res.status === 401) {
-    clearStoredAccessToken();
-    notifyAuthListeners(auth.currentUser);
-    throw new Error('انتهت صلاحية جلسة Google Drive، يرجى تسجيل الدخول مجدداً');
+  const response = await fetchWithTimeout(targetUrl, { method: 'GET' }, 30000);
+  if (!response.ok) {
+    throw new Error(`فشل تحميل النسخة من Google Drive (${response.status})`);
   }
 
-  if (!res.ok) {
-    throw new Error(`فشل تحميل النسخة الاحتياطية من درايف: ${res.statusText}`);
+  const result = await response.json();
+  if (!result.success || !result.content) {
+    throw new Error(result.error || 'ملف النسخة الاحتياطية فارغ أو تالف');
   }
 
-  const jsonContent = await res.text();
-  const success = pharmacyStorage.importAllDataJSON(jsonContent);
-  if (!success) {
-    throw new Error('فشل تطبيق واسترجاع بيانات ملف النسخة الاحتياطية');
+  const imported = pharmacyStorage.importAllDataJSON(result.content);
+  if (!imported) {
+    throw new Error('فشل تطبيق واسترجاع بيانات الصيدلية من الملف');
   }
 
   return true;
 }
 
 /**
- * Delete a backup file from Google Drive
+ * Test connectivity with Google Apps Script Web App
+ */
+export async function testGoogleDriveConnection(webAppUrl: string, token: string): Promise<{ success: boolean; message: string }> {
+  const trimmedUrl = webAppUrl.trim();
+  const trimmedToken = token.trim();
+
+  if (!trimmedUrl || !trimmedToken) {
+    return { success: false, message: 'يرجى إدخال الرابط ورمز الأمان أولاً' };
+  }
+
+  try {
+    const separator = trimmedUrl.includes('?') ? '&' : '?';
+    const targetUrl = `${trimmedUrl}${separator}action=ping&token=${encodeURIComponent(trimmedToken)}`;
+
+    const res = await fetchWithTimeout(targetUrl, { method: 'GET' }, 15000);
+    const data = await res.json();
+
+    if (data.success) {
+      return { success: true, message: data.message || 'تم التحقق بنجاح: الرابط ورمز الأمان يعملان بشكل سليم 🟢' };
+    } else {
+      return { success: false, message: data.error || 'رفض الخادم الطلب: تأكد من صحة رمز الأمان (Token)' };
+    }
+  } catch (err: any) {
+    return {
+      success: false,
+      message: `تعذر الاتصال بـ Google Apps Script: ${err.message || 'تأكد من نشر الويب آب بصلاحية Anyone وإتاحة الوصول'}`
+    };
+  }
+}
+
+/**
+ * Delete a backup file from Google Drive via Google Apps Script Web App
  */
 export async function deleteDriveBackupFile(fileId: string): Promise<boolean> {
-  const token = getDriveAccessToken();
-  if (!token) {
-    throw new Error('غير مصرح بالوصول إلى Google Drive');
+  const settings = pharmacyStorage.getSettings();
+  const webAppUrl = settings.googleWebAppUrl?.trim();
+  const backupToken = settings.backupToken?.trim();
+
+  if (!webAppUrl || !backupToken) {
+    throw new Error('رابط Web App أو رمز الأمان غير محدد في الإعدادات');
   }
 
-  const res = await fetch(`https://www.googleapis.com/drive/v3/files/${fileId}`, {
-    method: 'DELETE',
-    headers: { Authorization: `Bearer ${token}` },
-  });
+  const separator = webAppUrl.includes('?') ? '&' : '?';
+  const targetUrl = `${webAppUrl}${separator}action=delete&fileId=${encodeURIComponent(fileId)}&token=${encodeURIComponent(backupToken)}`;
 
-  if (res.status === 401) {
-    clearStoredAccessToken();
-    notifyAuthListeners(auth.currentUser);
-    throw new Error('انتهت صلاحية جلسة Google Drive، يرجى تسجيل الدخول مجدداً');
+  const response = await fetchWithTimeout(targetUrl, { method: 'GET' }, 20000);
+  if (!response.ok) {
+    throw new Error(`فشل حذف النسخة من Google Drive (${response.status})`);
   }
 
-  return res.ok;
+  const result = await response.json();
+  if (!result.success) {
+    throw new Error(result.error || 'فشل حذف النسخة');
+  }
+
+  return true;
 }
 
 /**
- * Check if the browser supports sharing files directly to Google Drive / Share Sheet
+ * Check and run scheduled daily backup
+ * - Triggers on app start if > 24 hours since last backup
+ * - Runs every 6 hours while the app remains open
  */
-export function canShareBackupDirectly(): boolean {
-  if (typeof navigator === 'undefined' || !navigator.share) return false;
-  try {
-    const dummyFile = new File(['{}'], 'test.json', { type: 'application/json' });
-    return !!(navigator.canShare && navigator.canShare({ files: [dummyFile] }));
-  } catch {
+export async function checkAndRunScheduledBackup(): Promise<boolean> {
+  const settings = pharmacyStorage.getSettings();
+  if (settings.autoDailyDriveBackup === false) return false;
+  if (typeof navigator !== 'undefined' && !navigator.onLine) return false;
+  if (!settings.googleWebAppUrl || !settings.backupToken) return false;
+
+  const now = Date.now();
+  const lastTimestamp = parseInt(localStorage.getItem(LAST_BACKUP_TIMESTAMP_KEY) || '0', 10);
+  const sixHoursMs = 6 * 60 * 60 * 1000;
+
+  // Run if never run or > 6 hours since last check
+  if (now - lastTimestamp < sixHoursMs) {
     return false;
   }
-}
 
-/**
- * Share backup file directly to Google Drive / system share sheet (Zero setup, works on Android & iOS & desktop)
- */
-export async function shareBackupToDriveDirectly(): Promise<boolean> {
-  const backupJson = pharmacyStorage.exportAllDataJSON();
-  const now = new Date();
-  const dateFormatted = now.toISOString().split('T')[0];
-  const timeFormatted = now.toTimeString().split(' ')[0].replace(/:/g, '-');
-  const fileName = `pharmacare_backup_${dateFormatted}_${timeFormatted}.json`;
-
-  const file = new File([backupJson], fileName, { type: 'application/json' });
-
-  if (navigator.share) {
-    await navigator.share({
-      title: 'نسخة احتياطية لنظام فارماكير بلس',
-      text: 'حفظ النسخة الاحتياطية لقاعدة بيانات الصيدلية مباشرة إلى Google Drive',
-      files: [file],
-    });
-    return true;
+  try {
+    console.log('PharmaCare: Initiating scheduled background Google Drive backup...');
+    const res = await uploadBackupToDrive(true);
+    if (res.success) {
+      console.log('PharmaCare: Scheduled Google Drive backup saved successfully:', res.fileName);
+      return true;
+    }
+  } catch (e) {
+    console.warn('PharmaCare: Scheduled backup skipped or failed:', e);
   }
   return false;
 }
 
-export async function triggerSilentCloudBackup(): Promise<{ driveSuccess: boolean; firestoreSuccess: boolean; message: string }> {
-  let driveSuccess = false;
-  let firestoreSuccess = false;
+// Aliases for compatibility
+export const checkAndRunDailyBackup = checkAndRunScheduledBackup;
 
-  // 1. Silent Firestore Cloud Backup Snapshot
+export async function triggerSilentCloudBackup(): Promise<{ success: boolean; name: string }> {
   try {
-    const firestoreRes = await firebaseSync.saveCloudSnapshotBackup(false);
-    firestoreSuccess = firestoreRes.success;
-  } catch (e) {
-    console.warn('Silent Firestore cloud backup failed:', e);
+    const res = await uploadBackupToDrive(true);
+    return { success: res.success, name: res.fileName };
+  } catch (err: any) {
+    return { success: false, name: '' };
   }
-
-  // 2. Direct Google Drive Cloud Upload
-  const token = getDriveAccessToken();
-  if (token) {
-    try {
-      await uploadBackupToDrive(true);
-      driveSuccess = true;
-    } catch (e) {
-      console.warn('Silent Google Drive upload failed:', e);
-    }
-  }
-
-  let message = '';
-  if (driveSuccess && firestoreSuccess) {
-    message = 'تم رفع النسخة الاحتياطية مباشرة إلى Google Drive وسحابة النظام ☁️';
-  } else if (driveSuccess) {
-    message = 'تم رفع النسخة الاحتياطية مباشرة إلى Google Drive ☁️';
-  } else if (firestoreSuccess) {
-    message = 'تم حفظ النسخة الاحتياطية السحابية بنجاح في سحابة النظام ☁️';
-  } else {
-    message = 'يرجى ربط وتنشيط Google Drive للرفع المباشر إلى حسابك.';
-  }
-
-  return { driveSuccess, firestoreSuccess, message };
 }
 
-export async function checkAndRunDailyBackup(): Promise<boolean> {
-  const settings = pharmacyStorage.getSettings();
-  if (settings.autoDailyDriveBackup === false) return false;
-  if (typeof navigator !== 'undefined' && !navigator.onLine) return false;
-
-  const today = new Date().toISOString().split('T')[0];
-  const lastBackup = localStorage.getItem(LAST_BACKUP_DATE_KEY);
-  if (lastBackup === today) return false;
-
-  let anySuccess = false;
-
-  // أولاً: نسخة Firestore السحابية التلقائية - لا تحتاج تسجيل دخول أبداً
-  try {
-    const res = await firebaseSync.saveCloudSnapshotBackup(true);
-    if (res.success) {
-      anySuccess = true;
-      console.log('PharmaCare: Auto Firestore snapshot backup completed for', today);
-    }
-  } catch (e) {
-    console.warn('Auto Firestore backup failed:', e);
-  }
-
-  // ثانياً: Google Drive فقط لو المستخدم سجّل دخول مسبقاً وعنده token
-  const token = getDriveAccessToken();
-  if (token) {
-    try {
-      await uploadBackupToDrive(true);
-      anySuccess = true;
-      console.log('PharmaCare: Auto Drive backup completed for', today);
-    } catch (err) {
-      console.warn('Auto Drive backup postponed (token may have expired):', err);
-      // لا تُظهر خطأ للمستخدم - الـ Firestore backup كافٍ
-    }
-  }
-
-  if (anySuccess) {
-    localStorage.setItem(LAST_BACKUP_DATE_KEY, today);
-  }
-
-  return anySuccess;
-}

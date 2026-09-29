@@ -1,5 +1,5 @@
 import React, { useEffect, useState } from 'react';
-import { WifiOff, RefreshCw, CheckCircle2 } from 'lucide-react';
+import { WifiOff, RefreshCw, CheckCircle2, AlertCircle } from 'lucide-react';
 import { firebaseSync, SyncStatus } from '../services/firebaseSync';
 
 export const OfflineIndicator: React.FC = () => {
@@ -9,6 +9,7 @@ export const OfflineIndicator: React.FC = () => {
   const [syncStatus, setSyncStatus] = useState<SyncStatus>('synced');
   const [pendingCount, setPendingCount] = useState(0);
   const [showSyncedToast, setShowSyncedToast] = useState(false);
+  const [errorToast, setErrorToast] = useState<string | null>(null);
 
   useEffect(() => {
     const handleOnline = () => {
@@ -30,12 +31,27 @@ export const OfflineIndicator: React.FC = () => {
       }
     });
 
+    const unsubError = firebaseSync.onError((msg) => {
+      setErrorToast(msg);
+      setTimeout(() => setErrorToast(null), 6000);
+    });
+
     return () => {
       window.removeEventListener('online', handleOnline);
       window.removeEventListener('offline', handleOffline);
       unsubscribe();
+      unsubError();
     };
   }, []);
+
+  if (errorToast) {
+    return (
+      <div className="fixed bottom-20 sm:bottom-4 left-4 z-50 flex items-center gap-2 rounded-xl bg-rose-600/95 backdrop-blur-xs px-3.5 py-2 text-xs font-semibold text-white shadow-xl" dir="rtl">
+        <AlertCircle className="w-4 h-4 text-rose-200 shrink-0" />
+        <span>{errorToast}</span>
+      </div>
+    );
+  }
 
   if (!isOnline) {
     return (

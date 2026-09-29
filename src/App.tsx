@@ -20,6 +20,7 @@ import { ContinuousScannerWidget } from './components/ContinuousScannerWidget';
 import { ThermalReceipt } from './components/ThermalReceipt';
 import { OfflineIndicator } from './components/OfflineIndicator';
 import { DeviceLinkModal } from './components/DeviceLinkModal';
+import { PharmacySetupModal } from './components/PharmacySetupModal';
 import { QuickStockAuditModal } from './components/QuickStockAuditModal';
 import { CustomerDisplayView } from './components/CustomerDisplayView';
 
@@ -28,11 +29,18 @@ import {
   firebaseSync, 
   subscribeToProducts, 
   subscribeToCategories, 
+  subscribeToManufacturers,
+  subscribeToIngredients,
   subscribeToInvoices, 
+  subscribeToPurchases,
   subscribeToCustomers, 
-  subscribeToSuppliers 
+  subscribeToSuppliers,
+  subscribeToVouchers,
+  subscribeToBanks,
+  subscribeToStockMovements,
+  subscribeToSettings
 } from './services/firebaseSync';
-import { checkAndRunDailyBackup, triggerSilentCloudBackup } from './services/googleDrive';
+import { checkAndRunScheduledBackup, uploadBackupToDrive } from './services/googleDrive';
 import { 
   MainTab, 
   Product, 
@@ -55,6 +63,23 @@ const VALID_TABS: MainTab[] = [
   'products', 'banks', 'customers', 'suppliers', 
   'invoices', 'vouchers', 'analytics', 'settings'
 ];
+
+function getUrlParams(): { pid?: string; code?: string } {
+  if (typeof window === 'undefined') return {};
+  const searchParams = new URLSearchParams(window.location.search);
+  let pid = searchParams.get('pid') || undefined;
+  let code = searchParams.get('code') || undefined;
+
+  if ((!pid || !code) && window.location.hash.includes('?')) {
+    const hashQuery = window.location.hash.split('?')[1];
+    if (hashQuery) {
+      const hashParams = new URLSearchParams(hashQuery);
+      pid = pid || hashParams.get('pid') || undefined;
+      code = code || hashParams.get('code') || undefined;
+    }
+  }
+  return { pid, code };
+}
 
 function getTabFromHash(): MainTab {
   if (typeof window !== 'undefined' && window.location.hash) {
@@ -111,6 +136,12 @@ export default function App() {
   const [scannedBarcodeTarget, setScannedBarcodeTarget] = useState<((code: string) => void) | null>(null);
   const [printingInvoice, setPrintingInvoice] = useState<Invoice | null>(null);
 
+  // URL Params & Multi-Device Pharmacy Setup Modal
+  const [urlParams] = useState(() => getUrlParams());
+  const [isPharmacySetupOpen, setIsPharmacySetupOpen] = useState<boolean>(() => {
+    return !firebaseSync.isLinked() || !!(urlParams.pid && urlParams.code);
+  });
+
   const handleOpenCustomerDisplay = () => {
     if (typeof window !== 'undefined') {
       const displayUrl = `${window.location.origin}${window.location.pathname}#/customer-display`;
@@ -159,9 +190,23 @@ export default function App() {
       setCategories(pharmacyStorage.getCategories());
     });
 
+    const unsubManufacturers = subscribeToManufacturers((cloudMans) => {
+      pharmacyStorage.mergeRemoteManufacturers(cloudMans);
+      setManufacturers(pharmacyStorage.getManufacturers());
+    });
+
+    const unsubIngredients = subscribeToIngredients((cloudIngs) => {
+      pharmacyStorage.mergeRemoteIngredients(cloudIngs);
+      setIngredients(pharmacyStorage.getIngredients());
+    });
+
     const unsubInvoices = subscribeToInvoices((cloudInvs) => {
       pharmacyStorage.mergeRemoteInvoices(cloudInvs);
       setInvoices(pharmacyStorage.getInvoices());
+    });
+
+    const unsubPurchases = subscribeToPurchases((cloudPurs) => {
+      pharmacyStorage.mergeRemotePurchases(cloudPurs);
     });
 
     const unsubCustomers = subscribeToCustomers((cloudCusts) => {
@@ -174,6 +219,25 @@ export default function App() {
       setSuppliers(pharmacyStorage.getSuppliers());
     });
 
+    const unsubVouchers = subscribeToVouchers((cloudVouchs) => {
+      pharmacyStorage.mergeRemoteVouchers(cloudVouchs);
+      setVouchers(pharmacyStorage.getVouchers());
+    });
+
+    const unsubBanks = subscribeToBanks((cloudBanks) => {
+      pharmacyStorage.mergeRemoteBanks(cloudBanks);
+      setBanks(pharmacyStorage.getBanks());
+    });
+
+    const unsubMovements = subscribeToStockMovements((cloudMovs) => {
+      pharmacyStorage.mergeRemoteStockMovements(cloudMovs);
+    });
+
+    const unsubSettings = subscribeToSettings((cloudSettings) => {
+      pharmacyStorage.mergeRemoteSettings(cloudSettings);
+      setSettings(pharmacyStorage.getSettings());
+    });
+
     const unsubscribePulled = firebaseSync.onDataPulled(() => {
       refreshAllState();
     });
@@ -184,47 +248,45 @@ export default function App() {
       }
     });
 
-    // Check automated daily silent cloud backup on load
-    checkAndRunDailyBackup().catch((e) => console.log('Daily backup auto check:', e));
+    const unsubscribePharma = firebaseSync.onPharmacyChange((pid) => {
+      setIsPharmacySetupOpen(!pid);
+      refreshAllState();
+    });
 
-    // Listen to network reconnection to sync and perform background cloud backup
+    // Check automated daily silent cloud snapshot backup on load
+    checkAndRunScheduledBackup().catch((e) => console.log('Scheduled backup auto check:', e));
+
     const handleOnline = () => {
-      checkAndRunDailyBackup().catch(() => {});
+      checkAndRunScheduledBackup().catch(() => {});
+      firebaseSync.syncNow().catch(() => {});
     };
     window.addEventListener('online', handleOnline);
 
-    // Periodic background silent cloud backup check every 15 minutes
-    const backupInterval = setInterval(() => {
-      if (typeof navigator !== 'undefined' && navigator.onLine) {
-        checkAndRunDailyBackup().catch(() => {});
-      }
-    }, 15 * 60 * 1000);
+    // Schedule background backup every 6 hours while app remains active
+    const interval = setInterval(() => {
+      checkAndRunScheduledBackup().catch(() => {});
+    }, 6 * 60 * 60 * 1000);
 
     return () => {
       unsubProducts();
       unsubCategories();
+      unsubManufacturers();
+      unsubIngredients();
       unsubInvoices();
+      unsubPurchases();
       unsubCustomers();
       unsubSuppliers();
+      unsubVouchers();
+      unsubBanks();
+      unsubMovements();
+      unsubSettings();
       unsubscribePulled();
       unsubscribeSync();
+      unsubscribePharma();
+      clearInterval(interval);
       window.removeEventListener('online', handleOnline);
-      clearInterval(backupInterval);
     };
   }, [refreshAllState]);
-
-  useEffect(() => {
-    if (typeof navigator === 'undefined' || !navigator.onLine) return;
-    const timer = setTimeout(async () => {
-      try {
-        const { firebaseSync: fs } = await import('./services/firebaseSync');
-        await fs.processQueue();
-      } catch (e) {
-        console.warn('Initial queue flush skipped:', e);
-      }
-    }, 4000);
-    return () => clearTimeout(timer);
-  }, []);
 
   // Settings update
   const handleUpdateSettings = (newSettings: Settings) => {
@@ -389,14 +451,14 @@ export default function App() {
   };
 
   // 7. Backup & Export / Import / Reset / 5000 Items
-  // Quick silent cloud backup (uploads directly to cloud without downloading to browser)
+  // Quick cloud backup to Google Drive Web App
   const handleQuickCloudBackup = async () => {
     try {
-      const res = await triggerSilentCloudBackup();
+      const res = await uploadBackupToDrive(false);
       if (isSoundOn) playSuccess();
-      alert(res.message);
+      alert(`تم حفظ النسخة بنجاح في Google Drive: ${res.fileName}`);
     } catch (e: any) {
-      alert('حدث خطأ أثناء الرفع السحابي: ' + (e?.message || 'خطأ غير معروف'));
+      alert('تنبيه: ' + (e?.message || 'يرجى ضبط رابط Web App ورمز الأمان في الإعدادات'));
     }
   };
 
@@ -690,6 +752,17 @@ export default function App() {
         isOpen={isDeviceLinkOpen}
         onClose={() => setIsDeviceLinkOpen(false)}
         products={products}
+      />
+
+      {/* First-Launch / Multi-Device Pharmacy Setup Modal */}
+      <PharmacySetupModal
+        isOpen={isPharmacySetupOpen}
+        onSuccess={() => {
+          setIsPharmacySetupOpen(false);
+          refreshAllState();
+        }}
+        initialPharmacyId={urlParams.pid || ''}
+        initialJoinCode={urlParams.code || ''}
       />
 
       {/* Quick Mobile Camera Stock Audit Modal */}

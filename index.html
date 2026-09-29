@@ -48,12 +48,36 @@
   </head>
   <body class="bg-slate-50 text-slate-900 antialiased select-none selection:bg-sky-100 selection:text-sky-900">
     <div id="root"></div>
+    <div id="sw-update-toast" style="display: none; position: fixed; bottom: 20px; left: 20px; right: 20px; max-width: 400px; margin: 0 auto; z-index: 99999; background: #0284c7; color: white; padding: 14px 18px; border-radius: 16px; box-shadow: 0 10px 25px rgba(0,0,0,0.3); font-family: 'Tajawal', sans-serif; direction: rtl; align-items: center; justify-content: space-between; gap: 12px;">
+      <div style="font-size: 13px; font-weight: bold;">🎉 يوجد تحديث جديد لفارماكير بلس!</div>
+      <button id="sw-update-btn" style="background: white; color: #0284c7; border: none; padding: 6px 14px; border-radius: 10px; font-weight: 800; font-size: 12px; cursor: pointer; white-space: nowrap;">تحديث الآن 🚀</button>
+    </div>
+    <!-- Google Identity Services for reliable client-side OAuth -->
+    <script src="https://accounts.google.com/gsi/client" async defer></script>
     <script>
       if ('serviceWorker' in navigator) {
         window.addEventListener('load', function() {
           navigator.serviceWorker.register('./sw.js', { scope: './' })
             .then(function(reg) {
               console.log('PharmaCare Service Worker Active:', reg.scope);
+              reg.addEventListener('updatefound', function() {
+                var newWorker = reg.installing;
+                if (newWorker) {
+                  newWorker.addEventListener('statechange', function() {
+                    if (newWorker.state === 'installed' && navigator.serviceWorker.controller) {
+                      var toast = document.getElementById('sw-update-toast');
+                      var btn = document.getElementById('sw-update-btn');
+                      if (toast && btn) {
+                        toast.style.display = 'flex';
+                        btn.onclick = function() {
+                          newWorker.postMessage({ type: 'SKIP_WAITING' });
+                          window.location.reload();
+                        };
+                      }
+                    }
+                  });
+                }
+              });
             })
             .catch(function(err) {
               console.warn('Service Worker registration skipped:', err);

@@ -287,32 +287,6 @@ class PharmacyStorageService {
     }
   }
 
-  // مزامنة حقيقية مع قاعدة بيانات Cloud SQL PostgreSQL
-  async syncWithCloudSQL(): Promise<boolean> {
-    try {
-      const res = await fetch('/api/sync');
-      if (!res.ok) return false;
-      const data = await res.json();
-      if (data.success) {
-        if (data.products && data.products.length > 0) this.setItem(STORAGE_KEYS.PRODUCTS, data.products);
-        if (data.categories && data.categories.length > 0) this.setItem(STORAGE_KEYS.CATEGORIES, data.categories);
-        if (data.manufacturers && data.manufacturers.length > 0) this.setItem(STORAGE_KEYS.MANUFACTURERS, data.manufacturers);
-        if (data.ingredients && data.ingredients.length > 0) this.setItem(STORAGE_KEYS.INGREDIENTS, data.ingredients);
-        if (data.banks && data.banks.length > 0) this.setItem(STORAGE_KEYS.BANKS, data.banks);
-        if (data.customers && data.customers.length > 0) this.setItem(STORAGE_KEYS.CUSTOMERS, data.customers);
-        if (data.suppliers && data.suppliers.length > 0) this.setItem(STORAGE_KEYS.SUPPLIERS, data.suppliers);
-        if (data.invoices && data.invoices.length > 0) this.setItem(STORAGE_KEYS.INVOICES, data.invoices);
-        if (data.purchases && data.purchases.length > 0) this.setItem(STORAGE_KEYS.PURCHASES, data.purchases);
-        if (data.vouchers && data.vouchers.length > 0) this.setItem(STORAGE_KEYS.VOUCHERS, data.vouchers);
-        if (data.settings) this.setItem(STORAGE_KEYS.SETTINGS, { ...DEFAULT_SETTINGS, ...data.settings });
-        return true;
-      }
-    } catch (e) {
-      console.warn('Cloud SQL sync skipped or offline, using local cache:', e);
-    }
-    return false;
-  }
-
   // تهيئة البيانات الأولية
   initializeDefaultData(): void {
     if (!localStorage.getItem(STORAGE_KEYS.INITIALIZED)) {
@@ -330,28 +304,6 @@ class PharmacyStorageService {
       this.setItem(STORAGE_KEYS.STOCK_MOVEMENTS, []);
       localStorage.setItem(STORAGE_KEYS.INITIALIZED, 'true');
     }
-    // حاول المزامنة مع Cloud SQL و Firestore
-    this.syncWithCloudSQL();
-    this.syncWithFirestore();
-  }
-
-  async syncWithFirestore(): Promise<boolean> {
-    try {
-      if (!navigator.onLine) return false;
-      const cloudProds = await firebaseSync.pullCollection<Product>('products');
-      if (cloudProds && cloudProds.length > 0) {
-        const local = this.getProducts();
-        const map = new Map<string, Product>();
-        cloudProds.forEach(p => map.set(p.id, p));
-        local.forEach(p => {
-          if (!map.has(p.id)) map.set(p.id, p);
-        });
-        this.setItem(STORAGE_KEYS.PRODUCTS, Array.from(map.values()));
-      }
-      return true;
-    } catch {
-      return false;
-    }
   }
 
   // الإعدادات
@@ -361,7 +313,7 @@ class PharmacyStorageService {
 
   saveSettings(settings: Settings): void {
     this.setItem(STORAGE_KEYS.SETTINGS, settings);
-    firebaseSync.enqueue('settings', 'current', settings);
+    firebaseSync.saveDoc('settings', 'current', settings);
   }
 
   // المواد الفعالة
@@ -375,13 +327,13 @@ class PharmacyStorageService {
     if (index >= 0) list[index] = ingredient;
     else list.push(ingredient);
     this.setItem(STORAGE_KEYS.INGREDIENTS, list);
-    firebaseSync.enqueue('ingredients', ingredient.id, ingredient);
+    firebaseSync.saveDoc('ingredients', ingredient.id, ingredient);
   }
 
   deleteIngredient(id: string): void {
     const list = this.getIngredients().filter(i => i.id !== id);
     this.setItem(STORAGE_KEYS.INGREDIENTS, list);
-    firebaseSync.enqueue('ingredients', id, null, 'delete');
+    firebaseSync.deleteDoc('ingredients', id);
   }
 
   // التصنيفات
@@ -395,13 +347,13 @@ class PharmacyStorageService {
     if (index >= 0) list[index] = category;
     else list.push(category);
     this.setItem(STORAGE_KEYS.CATEGORIES, list);
-    firebaseSync.enqueue('categories', category.id, category);
+    firebaseSync.saveDoc('categories', category.id, category);
   }
 
   deleteCategory(id: string): void {
     const list = this.getCategories().filter(c => c.id !== id);
     this.setItem(STORAGE_KEYS.CATEGORIES, list);
-    firebaseSync.enqueue('categories', id, null, 'delete');
+    firebaseSync.deleteDoc('categories', id);
   }
 
   // المصانع
@@ -415,13 +367,13 @@ class PharmacyStorageService {
     if (index >= 0) list[index] = manufacturer;
     else list.push(manufacturer);
     this.setItem(STORAGE_KEYS.MANUFACTURERS, list);
-    firebaseSync.enqueue('manufacturers', manufacturer.id, manufacturer);
+    firebaseSync.saveDoc('manufacturers', manufacturer.id, manufacturer);
   }
 
   deleteManufacturer(id: string): void {
     const list = this.getManufacturers().filter(m => m.id !== id);
     this.setItem(STORAGE_KEYS.MANUFACTURERS, list);
-    firebaseSync.enqueue('manufacturers', id, null, 'delete');
+    firebaseSync.deleteDoc('manufacturers', id);
   }
 
   // الأصناف مع الشجرة الذكية للوحدات والأسعار
@@ -455,13 +407,13 @@ class PharmacyStorageService {
     }
     this.setItem(STORAGE_KEYS.PRODUCTS, list);
     
-    firebaseSync.enqueue('products', updatedProduct.id, updatedProduct);
+    firebaseSync.saveDoc('products', updatedProduct.id, updatedProduct);
   }
 
   deleteProduct(id: string): void {
     const list = this.getProducts().filter(p => p.id !== id);
     this.setItem(STORAGE_KEYS.PRODUCTS, list);
-    firebaseSync.enqueue('products', id, null, 'delete');
+    firebaseSync.deleteDoc('products', id);
   }
 
   // البنوك والمحافظ والحسابات الفرعية
@@ -484,13 +436,13 @@ class PharmacyStorageService {
     if (index >= 0) list[index] = bank;
     else list.push(bank);
     this.setItem(STORAGE_KEYS.BANKS, list);
-    firebaseSync.enqueue('banks', bank.id, bank);
+    firebaseSync.saveDoc('banks', bank.id, bank);
   }
 
   deleteBank(id: string): void {
     const list = this.getBanks().filter(b => b.id !== id);
     this.setItem(STORAGE_KEYS.BANKS, list);
-    firebaseSync.enqueue('banks', id, null, 'delete');
+    firebaseSync.deleteDoc('banks', id);
   }
 
   // إضافة أو تعديل حساب فرعي لبنك محدد
@@ -527,13 +479,13 @@ class PharmacyStorageService {
     if (index >= 0) list[index] = customer;
     else list.push(customer);
     this.setItem(STORAGE_KEYS.CUSTOMERS, list);
-    firebaseSync.enqueue('customers', customer.id, customer);
+    firebaseSync.saveDoc('customers', customer.id, customer);
   }
 
   deleteCustomer(id: string): void {
     const list = this.getCustomers().filter(c => c.id !== id);
     this.setItem(STORAGE_KEYS.CUSTOMERS, list);
-    firebaseSync.enqueue('customers', id, null, 'delete');
+    firebaseSync.deleteDoc('customers', id);
   }
 
   // الموردون
@@ -547,13 +499,13 @@ class PharmacyStorageService {
     if (index >= 0) list[index] = supplier;
     else list.push(supplier);
     this.setItem(STORAGE_KEYS.SUPPLIERS, list);
-    firebaseSync.enqueue('suppliers', supplier.id, supplier);
+    firebaseSync.saveDoc('suppliers', supplier.id, supplier);
   }
 
   deleteSupplier(id: string): void {
     const list = this.getSuppliers().filter(s => s.id !== id);
     this.setItem(STORAGE_KEYS.SUPPLIERS, list);
-    firebaseSync.enqueue('suppliers', id, null, 'delete');
+    firebaseSync.deleteDoc('suppliers', id);
   }
 
   // حركات المخزون
@@ -634,7 +586,24 @@ class PharmacyStorageService {
     this.setItem(STORAGE_KEYS.PRODUCTS, products);
     this.setItem(STORAGE_KEYS.STOCK_MOVEMENTS, movements);
     this.setItem(STORAGE_KEYS.INVOICES, invoices);
-    firebaseSync.enqueue('invoices', invoice.id, invoice);
+
+    // مزامنة فورية مباشرة مع Firestore لكافة الأطراف المتأثرة
+    firebaseSync.saveDoc('invoices', invoice.id, invoice);
+    invoice.items.forEach(item => {
+      const p = products.find(prod => prod.id === item.productId);
+      if (p) firebaseSync.saveDoc('products', p.id, p);
+    });
+    if (invoice.customerId) {
+      const cust = this.getCustomers().find(c => c.id === invoice.customerId);
+      if (cust) firebaseSync.saveDoc('customers', cust.id, cust);
+    }
+    if (invoice.bankId) {
+      const bnk = this.getBanks().find(b => b.id === invoice.bankId);
+      if (bnk) firebaseSync.saveDoc('banks', bnk.id, bnk);
+    }
+    movements.slice(0, invoice.items.length).forEach(m => {
+      firebaseSync.saveDoc('stockMovements', m.id, m);
+    });
   }
 
   // إلغاء فاتورة
@@ -700,7 +669,21 @@ class PharmacyStorageService {
     this.setItem(STORAGE_KEYS.PRODUCTS, products);
     this.setItem(STORAGE_KEYS.STOCK_MOVEMENTS, movements);
     this.setItem(STORAGE_KEYS.INVOICES, invoices);
-    firebaseSync.enqueue('invoices', invoice.id, invoice);
+
+    // مزامنة فورية مباشرة مع Firestore
+    firebaseSync.saveDoc('invoices', invoice.id, invoice);
+    invoice.items.forEach(item => {
+      const p = products.find(prod => prod.id === item.productId);
+      if (p) firebaseSync.saveDoc('products', p.id, p);
+    });
+    if (invoice.customerId) {
+      const cust = this.getCustomers().find(c => c.id === invoice.customerId);
+      if (cust) firebaseSync.saveDoc('customers', cust.id, cust);
+    }
+    if (invoice.bankId) {
+      const bnk = this.getBanks().find(b => b.id === invoice.bankId);
+      if (bnk) firebaseSync.saveDoc('banks', bnk.id, bnk);
+    }
 
     return true;
   }
@@ -804,7 +787,33 @@ class PharmacyStorageService {
     this.setItem(STORAGE_KEYS.PRODUCTS, products);
     this.setItem(STORAGE_KEYS.STOCK_MOVEMENTS, movements);
     this.setItem(STORAGE_KEYS.PURCHASES, purchases);
-    firebaseSync.enqueue('purchases', purchase.id, purchase);
+
+    // مزامنة فورية مباشرة مع Firestore
+    firebaseSync.saveDoc('purchases', purchase.id, purchase);
+    purchase.items.forEach(item => {
+      const p = products.find(prod => prod.id === item.productId);
+      if (p) firebaseSync.saveDoc('products', p.id, p);
+    });
+    if (purchase.partyType === 'supplier' && purchase.partyId) {
+      const s = this.getSuppliers().find(sup => sup.id === purchase.partyId);
+      if (s) firebaseSync.saveDoc('suppliers', s.id, s);
+    } else if (purchase.partyType === 'customer' && purchase.partyId) {
+      const c = this.getCustomers().find(cust => cust.id === purchase.partyId);
+      if (c) firebaseSync.saveDoc('customers', c.id, c);
+    }
+    if (purchase.bankId) {
+      const bnk = this.getBanks().find(b => b.id === purchase.bankId);
+      if (bnk) firebaseSync.saveDoc('banks', bnk.id, bnk);
+    }
+    movements.slice(0, purchase.items.length).forEach(m => {
+      firebaseSync.saveDoc('stockMovements', m.id, m);
+    });
+  }
+
+  deletePurchase(purchaseId: string): void {
+    const list = this.getPurchases().filter(p => p.id !== purchaseId);
+    this.setItem(STORAGE_KEYS.PURCHASES, list);
+    firebaseSync.deleteDoc('purchases', purchaseId);
   }
 
   cancelPurchase(purchaseId: string): boolean {
@@ -869,7 +878,21 @@ class PharmacyStorageService {
     this.setItem(STORAGE_KEYS.PRODUCTS, products);
     this.setItem(STORAGE_KEYS.STOCK_MOVEMENTS, movements);
     this.setItem(STORAGE_KEYS.PURCHASES, purchases);
-    firebaseSync.enqueue('purchases', purchase.id, purchase);
+
+    // مزامنة فورية مباشرة مع Firestore
+    firebaseSync.saveDoc('purchases', purchase.id, purchase);
+    purchase.items.forEach(item => {
+      const p = products.find(prod => prod.id === item.productId);
+      if (p) firebaseSync.saveDoc('products', p.id, p);
+    });
+    if (purchase.partyType === 'supplier' && purchase.partyId) {
+      const s = this.getSuppliers().find(sup => sup.id === purchase.partyId);
+      if (s) firebaseSync.saveDoc('suppliers', s.id, s);
+    }
+    if (purchase.bankId) {
+      const bnk = this.getBanks().find(b => b.id === purchase.bankId);
+      if (bnk) firebaseSync.saveDoc('banks', bnk.id, bnk);
+    }
 
     return true;
   }
@@ -939,7 +962,18 @@ class PharmacyStorageService {
     }
 
     this.setItem(STORAGE_KEYS.VOUCHERS, vouchers);
-    firebaseSync.enqueue('vouchers', voucher.id, voucher);
+    firebaseSync.saveDoc('vouchers', voucher.id, voucher);
+    if (voucher.type === 'receipt' && voucher.partyType === 'customer' && voucher.partyId) {
+      const cust = this.getCustomers().find(c => c.id === voucher.partyId);
+      if (cust) firebaseSync.saveDoc('customers', cust.id, cust);
+    } else if (voucher.type === 'payment' && voucher.partyType === 'supplier' && voucher.partyId) {
+      const supp = this.getSuppliers().find(s => s.id === voucher.partyId);
+      if (supp) firebaseSync.saveDoc('suppliers', supp.id, supp);
+    }
+    if (voucher.paymentMethod === 'bank' && voucher.bankId) {
+      const bnk = this.getBanks().find(b => b.id === voucher.bankId);
+      if (bnk) firebaseSync.saveDoc('banks', bnk.id, bnk);
+    }
   }
 
   deleteVoucher(voucherId: string): void {
@@ -955,6 +989,7 @@ class PharmacyStorageService {
       if (idx >= 0) {
         customers[idx].balance = (customers[idx].balance || 0) + voucher.amount;
         this.setItem(STORAGE_KEYS.CUSTOMERS, customers);
+        firebaseSync.saveDoc('customers', customers[idx].id, customers[idx]);
       }
     } else if (voucher.type === 'payment' && voucher.partyType === 'supplier' && voucher.partyId) {
       const suppliers = this.getSuppliers();
@@ -962,12 +997,13 @@ class PharmacyStorageService {
       if (idx >= 0) {
         suppliers[idx].balance = (suppliers[idx].balance || 0) + voucher.amount;
         this.setItem(STORAGE_KEYS.SUPPLIERS, suppliers);
+        firebaseSync.saveDoc('suppliers', suppliers[idx].id, suppliers[idx]);
       }
     }
 
     vouchers.splice(vIndex, 1);
     this.setItem(STORAGE_KEYS.VOUCHERS, vouchers);
-    firebaseSync.enqueue('vouchers', voucherId, null, 'delete');
+    firebaseSync.deleteDoc('vouchers', voucherId);
   }
 
   getNextVoucherNumber(type: 'receipt' | 'payment' | 'journal'): string {
@@ -1052,7 +1088,7 @@ class PharmacyStorageService {
   deleteInvoice(invoiceId: string): void {
     const list = this.getInvoices().filter(i => i.id !== invoiceId);
     this.setItem(STORAGE_KEYS.INVOICES, list);
-    firebaseSync.enqueue('invoices', invoiceId, null, 'delete');
+    firebaseSync.deleteDoc('invoices', invoiceId);
   }
 
   saveVoucher(voucher: Voucher): void {
@@ -1122,118 +1158,71 @@ class PharmacyStorageService {
     this.setItem(STORAGE_KEYS.PRODUCTS, [...prods, ...newItems]);
   }
 
-  // --- دوال دمج البيانات السحابية مع المخزن المحلي دون فقدان العمليات المعلقة ---
+  // --- دوال دمج البيانات السحابية مع المخزن المحلي ---
   mergeRemoteProducts(remote: Product[]): void {
-    if (!remote || remote.length === 0) return;
-    const local = this.getProducts();
-    const queue = firebaseSync.getQueue();
-    const pendingIds = new Set(queue.filter(q => q.collection === 'products').map(q => q.id));
-
-    const map = new Map<string, Product>();
-    remote.forEach(p => map.set(p.id, p));
-    local.forEach(p => {
-      // إذا كان الصنف عُدّل محلياً أثناء انقطاع النت ولم يُرفع بعد، نحتفظ بالنسخة المحلية
-      if (pendingIds.has(p.id) || !map.has(p.id)) {
-        map.set(p.id, p);
-      }
-    });
-    this.setItem(STORAGE_KEYS.PRODUCTS, Array.from(map.values()));
+    if (!remote) return;
+    this.setItem(STORAGE_KEYS.PRODUCTS, remote);
   }
 
   mergeRemoteInvoices(remote: Invoice[]): void {
-    if (!remote || remote.length === 0) return;
-    const local = this.getInvoices();
-    const queue = firebaseSync.getQueue();
-    const pendingIds = new Set(queue.filter(q => q.collection === 'invoices').map(q => q.id));
-
-    const map = new Map<string, Invoice>();
-    remote.forEach(inv => map.set(inv.id, inv));
-    local.forEach(inv => {
-      if (pendingIds.has(inv.id) || !map.has(inv.id)) {
-        map.set(inv.id, inv);
-      }
-    });
-    const sorted = Array.from(map.values()).sort((a, b) => new Date(b.date).getTime() - new Date(a.date).getTime());
+    if (!remote) return;
+    const sorted = [...remote].sort((a, b) => new Date(b.date).getTime() - new Date(a.date).getTime());
     this.setItem(STORAGE_KEYS.INVOICES, sorted);
   }
 
   mergeRemoteCustomers(remote: Customer[]): void {
-    if (!remote || remote.length === 0) return;
-    const local = this.getCustomers();
-    const queue = firebaseSync.getQueue();
-    const pendingIds = new Set(queue.filter(q => q.collection === 'customers').map(q => q.id));
-
-    const map = new Map<string, Customer>();
-    remote.forEach(c => map.set(c.id, c));
-    local.forEach(c => {
-      if (pendingIds.has(c.id) || !map.has(c.id)) {
-        map.set(c.id, c);
-      }
-    });
-    this.setItem(STORAGE_KEYS.CUSTOMERS, Array.from(map.values()));
+    if (!remote) return;
+    this.setItem(STORAGE_KEYS.CUSTOMERS, remote);
   }
 
   mergeRemoteSuppliers(remote: Supplier[]): void {
-    if (!remote || remote.length === 0) return;
-    const local = this.getSuppliers();
-    const queue = firebaseSync.getQueue();
-    const pendingIds = new Set(queue.filter(q => q.collection === 'suppliers').map(q => q.id));
-
-    const map = new Map<string, Supplier>();
-    remote.forEach(s => map.set(s.id, s));
-    local.forEach(s => {
-      if (pendingIds.has(s.id) || !map.has(s.id)) {
-        map.set(s.id, s);
-      }
-    });
-    this.setItem(STORAGE_KEYS.SUPPLIERS, Array.from(map.values()));
+    if (!remote) return;
+    this.setItem(STORAGE_KEYS.SUPPLIERS, remote);
   }
 
   mergeRemotePurchases(remote: Purchase[]): void {
-    if (!remote || remote.length === 0) return;
-    const local = this.getPurchases();
-    const queue = firebaseSync.getQueue();
-    const pendingIds = new Set(queue.filter(q => q.collection === 'purchases').map(q => q.id));
-
-    const map = new Map<string, Purchase>();
-    remote.forEach(p => map.set(p.id, p));
-    local.forEach(p => {
-      if (pendingIds.has(p.id) || !map.has(p.id)) {
-        map.set(p.id, p);
-      }
-    });
-    const sorted = Array.from(map.values()).sort((a, b) => new Date(b.date).getTime() - new Date(a.date).getTime());
+    if (!remote) return;
+    const sorted = [...remote].sort((a, b) => new Date(b.date).getTime() - new Date(a.date).getTime());
     this.setItem(STORAGE_KEYS.PURCHASES, sorted);
   }
 
   mergeRemoteVouchers(remote: Voucher[]): void {
-    if (!remote || remote.length === 0) return;
-    const local = this.getVouchers();
-    const queue = firebaseSync.getQueue();
-    const pendingIds = new Set(queue.filter(q => q.collection === 'vouchers').map(q => q.id));
-
-    const map = new Map<string, Voucher>();
-    remote.forEach(v => map.set(v.id, v));
-    local.forEach(v => {
-      if (pendingIds.has(v.id) || !map.has(v.id)) {
-        map.set(v.id, v);
-      }
-    });
-    const sorted = Array.from(map.values()).sort((a, b) => new Date(b.date).getTime() - new Date(a.date).getTime());
+    if (!remote) return;
+    const sorted = [...remote].sort((a, b) => new Date(b.date).getTime() - new Date(a.date).getTime());
     this.setItem(STORAGE_KEYS.VOUCHERS, sorted);
   }
 
   mergeRemoteCategories(remote: Category[]): void {
-    if (!remote || remote.length === 0) return;
-    const local = this.getCategories();
-    const map = new Map<string, Category>();
-    remote.forEach(c => map.set(c.id, c));
-    local.forEach(c => {
-      if (!map.has(c.id)) {
-        map.set(c.id, c);
-      }
-    });
-    this.setItem(STORAGE_KEYS.CATEGORIES, Array.from(map.values()));
+    if (!remote) return;
+    this.setItem(STORAGE_KEYS.CATEGORIES, remote);
+  }
+
+  mergeRemoteBanks(remote: Bank[]): void {
+    if (!remote) return;
+    this.setItem(STORAGE_KEYS.BANKS, remote);
+  }
+
+  mergeRemoteStockMovements(remote: StockMovement[]): void {
+    if (!remote) return;
+    const sorted = [...remote].sort((a, b) => new Date(b.date).getTime() - new Date(a.date).getTime());
+    this.setItem(STORAGE_KEYS.STOCK_MOVEMENTS, sorted.slice(0, 1000));
+  }
+
+  mergeRemoteIngredients(remote: Ingredient[]): void {
+    if (!remote) return;
+    this.setItem(STORAGE_KEYS.INGREDIENTS, remote);
+  }
+
+  mergeRemoteManufacturers(remote: Manufacturer[]): void {
+    if (!remote) return;
+    this.setItem(STORAGE_KEYS.MANUFACTURERS, remote);
+  }
+
+  mergeRemoteSettings(remote: Settings): void {
+    if (!remote) return;
+    const current = this.getSettings();
+    const merged: Settings = { ...current, ...remote };
+    this.setItem(STORAGE_KEYS.SETTINGS, merged);
   }
 
   // تصدير ملف إكسل محلي (CSV) للأصناف والمخزون بدون إنترنت
