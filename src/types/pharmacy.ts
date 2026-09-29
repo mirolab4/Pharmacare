@@ -268,6 +268,16 @@ export interface StockMovement {
   balanceAfter: number;
 }
 
+export interface LinkedDevice {
+  deviceId: string;
+  deviceName: string;
+  deviceType: string;
+  joinedAt: string;
+  lastSeen: string;
+  isOwner?: boolean;
+  revoked?: boolean;
+}
+
 export type MainTab = 
   | 'pos' 
   | 'sales_returns'

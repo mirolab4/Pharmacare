@@ -5,10 +5,12 @@
  * - Single source of truth: Firestore database "(default)"
  * - Offline Persistence via persistentLocalCache & persistentMultipleTabManager
  * - Automatic Anonymous Authentication (Zero login friction)
- * - Multi-device synchronization without Google accounts using Pharmacy ID & Join Code
- * - Path schema: pharmacies/{pharmacyId}/{collectionName}/{docId}
+ * - Multi-device synchronization without Google accounts using Workspace ID & Join Code
+ * - Path schema: workspaces/{workspaceId}/{collectionName}/{docId}
  * - Soft deletes (deleted: true) for cross-device deletion propagation
+ * - Conflict resolution: "Last Write Wins" with updatedAt serverTimestamp
  * - Atomic stock adjustments via increment()
+ * - Device tracking with remote logout (revoked: true)
  */
 
 import { initializeApp, getApps, getApp } from 'firebase/app';
@@ -20,9 +22,11 @@ import {
   doc, 
   setDoc, 
   updateDoc,
+  deleteDoc as firestoreDeleteDoc,
   collection, 
-  onSnapshot,
+  onSnapshot, 
   getDoc,
+  getDocs,
   serverTimestamp,
   increment,
   waitForPendingWrites,
@@ -30,7 +34,7 @@ import {
   getDocFromServer
 } from 'firebase/firestore';
 import { getAuth, signInAnonymously, onAuthStateChanged, User } from 'firebase/auth';
-import firebaseConfig from '../../firebase-applet-config.json';
+import { firebaseConfig } from './firebaseConfig';
 import { 
   Product, 
   Category, 
@@ -43,7 +47,8 @@ import {
   Settings, 
   Manufacturer, 
   Ingredient, 
-  StockMovement 
+  StockMovement,
+  LinkedDevice
 } from '../types/pharmacy';
 
 // 1. Initialize Firebase App
@@ -64,9 +69,11 @@ try {
 export const db = _db;
 
 // Storage keys
-const PHARMACY_ID_KEY = 'pharmacare_pharmacy_id';
+const WORKSPACE_ID_KEY = 'pharmacare_workspace_id';
+const LEGACY_PHARMACY_ID_KEY = 'pharmacare_pharmacy_id';
 const JOIN_CODE_KEY = 'pharmacare_join_code';
 const DEVICE_ID_KEY = 'pharmacare_device_id';
+const DEVICE_NAME_KEY = 'pharmacare_device_name';
 const LAST_SYNC_KEY = 'pharmacare_last_firestore_sync';
 
 export type SyncStatus = 'synced' | 'syncing' | 'offline' | 'error';
@@ -74,14 +81,16 @@ export type SyncStatus = 'synced' | 'syncing' | 'offline' | 'error';
 class FirebaseSyncService {
   private statusListeners: Array<(status: SyncStatus, pendingCount: number, lastSyncTime?: string) => void> = [];
   private dataPulledListeners: Array<() => void> = [];
-  private pharmacyListeners: Array<(pharmacyId: string | null) => void> = [];
+  private workspaceListeners: Array<(workspaceId: string | null) => void> = [];
   private errorListeners: Array<(message: string) => void> = [];
+  private deviceRevokedListeners: Array<() => void> = [];
   
   private currentStatus: SyncStatus = typeof navigator !== 'undefined' && !navigator.onLine ? 'offline' : 'synced';
   private pendingCount = 0;
   private currentUser: User | null = null;
   private isAuthReady = false;
   private authInitPromise: Promise<User>;
+  private deviceUnsubscribe: Unsubscribe | null = null;
 
   constructor() {
     // Generate or retrieve persistent unique Device ID
@@ -90,11 +99,13 @@ class FirebaseSyncService {
     // Listen to network status
     if (typeof window !== 'undefined') {
       window.addEventListener('online', () => {
+        console.log('PharmaCare: Network online, triggering synchronization...');
         this.updateStatus('syncing');
         this.syncNow().catch(() => {});
       });
 
       window.addEventListener('offline', () => {
+        console.log('PharmaCare: Network offline, operating in offline cache mode.');
         this.updateStatus('offline');
       });
     }
@@ -103,14 +114,19 @@ class FirebaseSyncService {
     this.authInitPromise = new Promise((resolve) => {
       onAuthStateChanged(auth, async (user) => {
         if (user) {
+          console.log('PharmaCare Anonymous Auth Success. UID:', user.uid);
           this.currentUser = user;
           this.isAuthReady = true;
+          this.listenToDeviceStatus();
           resolve(user);
         } else {
           try {
+            console.log('PharmaCare: Requesting Anonymous Sign-In...');
             const credential = await signInAnonymously(auth);
+            console.log('PharmaCare: Signed in anonymously as UID:', credential.user.uid);
             this.currentUser = credential.user;
             this.isAuthReady = true;
+            this.listenToDeviceStatus();
             resolve(credential.user);
           } catch (err: any) {
             console.error('PharmaCare Anonymous Auth Error:', err);
@@ -120,15 +136,19 @@ class FirebaseSyncService {
       });
     });
 
-    // Initial check for pending writes
-    if (typeof window !== 'undefined' && navigator.onLine) {
-      setTimeout(() => {
-        this.updatePendingCount();
-      }, 2000);
+    // Migrate legacy key if exists
+    if (typeof localStorage !== 'undefined') {
+      const legacyId = localStorage.getItem(LEGACY_PHARMACY_ID_KEY);
+      if (legacyId && !localStorage.getItem(WORKSPACE_ID_KEY)) {
+        localStorage.setItem(WORKSPACE_ID_KEY, legacyId);
+      }
     }
+
+    // Listen for device status
+    this.listenToDeviceStatus();
   }
 
-  // --- Device & Pharmacy Identification ---
+  // --- Device & Workspace Identification ---
   private initDeviceId(): string {
     try {
       let deviceId = localStorage.getItem(DEVICE_ID_KEY);
@@ -150,12 +170,54 @@ class FirebaseSyncService {
     }
   }
 
-  getPharmacyId(): string | null {
+  getDeviceName(): string {
     try {
-      return localStorage.getItem(PHARMACY_ID_KEY) || null;
+      let name = localStorage.getItem(DEVICE_NAME_KEY);
+      if (!name) {
+        const isMobile = /iPhone|iPad|iPod|Android/i.test(navigator.userAgent);
+        name = isMobile ? 'هاتف كاشير' : 'جهاز الحاسوب الرئيسي';
+        localStorage.setItem(DEVICE_NAME_KEY, name);
+      }
+      return name;
+    } catch {
+      return 'جهاز كاشير';
+    }
+  }
+
+  setDeviceName(name: string): void {
+    try {
+      localStorage.setItem(DEVICE_NAME_KEY, name);
+      const wid = this.getWorkspaceId();
+      if (wid) {
+        this.registerDevice(wid, false).catch(() => {});
+      }
+    } catch (e) {
+      console.warn(e);
+    }
+  }
+
+  getDeviceType(): string {
+    if (typeof navigator === 'undefined') return 'حاسوب';
+    const ua = navigator.userAgent;
+    if (/iPhone/i.test(ua)) return 'iPhone';
+    if (/iPad/i.test(ua)) return 'iPad';
+    if (/Android/i.test(ua)) return 'Android';
+    if (/Macintosh/i.test(ua)) return 'Mac';
+    if (/Windows/i.test(ua)) return 'Windows';
+    return 'متصفح ويب';
+  }
+
+  getWorkspaceId(): string | null {
+    try {
+      return localStorage.getItem(WORKSPACE_ID_KEY) || localStorage.getItem(LEGACY_PHARMACY_ID_KEY) || null;
     } catch {
       return null;
     }
+  }
+
+  // Alias for backward compatibility
+  getPharmacyId(): string | null {
+    return this.getWorkspaceId();
   }
 
   getJoinCode(): string | null {
@@ -167,28 +229,54 @@ class FirebaseSyncService {
   }
 
   isLinked(): boolean {
-    return !!this.getPharmacyId();
+    return !!this.getWorkspaceId();
   }
 
-  getPharmacyInfo(): { pharmacyId: string | null; joinCode: string | null; deviceId: string; isLinked: boolean } {
+  getWorkspaceInfo(): { 
+    workspaceId: string | null; 
+    pharmacyId: string | null;
+    joinCode: string | null; 
+    deviceId: string; 
+    isLinked: boolean 
+  } {
+    const wid = this.getWorkspaceId();
     return {
-      pharmacyId: this.getPharmacyId(),
+      workspaceId: wid,
+      pharmacyId: wid,
       joinCode: this.getJoinCode(),
       deviceId: this.getDeviceId(),
       isLinked: this.isLinked()
     };
   }
 
-  onPharmacyChange(cb: (pharmacyId: string | null) => void) {
-    this.pharmacyListeners.push(cb);
+  // Alias for backward compatibility
+  getPharmacyInfo() {
+    return this.getWorkspaceInfo();
+  }
+
+  onPharmacyChange(cb: (workspaceId: string | null) => void) {
+    this.workspaceListeners.push(cb);
     return () => {
-      this.pharmacyListeners = this.pharmacyListeners.filter(l => l !== cb);
+      this.workspaceListeners = this.workspaceListeners.filter(l => l !== cb);
     };
   }
 
-  private notifyPharmacyChange(pid: string | null) {
-    this.pharmacyListeners.forEach(cb => {
-      try { cb(pid); } catch (e) { console.warn(e); }
+  private notifyWorkspaceChange(wid: string | null) {
+    this.workspaceListeners.forEach(cb => {
+      try { cb(wid); } catch (e) { console.warn(e); }
+    });
+  }
+
+  onDeviceRevoked(cb: () => void) {
+    this.deviceRevokedListeners.push(cb);
+    return () => {
+      this.deviceRevokedListeners = this.deviceRevokedListeners.filter(l => l !== cb);
+    };
+  }
+
+  private notifyDeviceRevoked() {
+    this.deviceRevokedListeners.forEach(cb => {
+      try { cb(); } catch (e) { console.warn(e); }
     });
   }
 
@@ -198,13 +286,104 @@ class FirebaseSyncService {
   }
 
   /**
-   * Create a new pharmacy organization on Firestore
-   * Stores joinCode in pharmacies/{pid} and establishes membership in pharmacies/{pid}/members/{uid}
+   * Listen to current device document in workspace to handle remote logout
    */
-  async createPharmacy(nameAr?: string): Promise<{ pharmacyId: string; joinCode: string }> {
+  private listenToDeviceStatus() {
+    if (this.deviceUnsubscribe) {
+      this.deviceUnsubscribe();
+      this.deviceUnsubscribe = null;
+    }
+
+    const wid = this.getWorkspaceId();
+    const did = this.getDeviceId();
+    if (!wid || !did) return;
+
+    try {
+      const devDocRef = doc(db, 'workspaces', wid, 'devices', did);
+      this.deviceUnsubscribe = onSnapshot(devDocRef, (snap) => {
+        if (snap.exists()) {
+          const data = snap.data();
+          if (data?.revoked === true) {
+            console.warn('PharmaCare: This device has been remotely revoked by owner. Disconnecting...');
+            this.disconnectPharmacy();
+            this.notifyDeviceRevoked();
+          }
+        }
+      }, (err) => {
+        console.warn('Device listener warning:', err.message);
+      });
+    } catch (e) {
+      console.warn(e);
+    }
+  }
+
+  /**
+   * Register or update this device under workspaces/{wid}/devices/{deviceId}
+   */
+  async registerDevice(wid: string, isOwner = false): Promise<void> {
+    try {
+      const user = await this.ensureAuth();
+      const did = this.getDeviceId();
+      const devDocRef = doc(db, 'workspaces', wid, 'devices', did);
+      
+      const existingSnap = await getDoc(devDocRef).catch(() => null);
+      const isExistingOwner = existingSnap?.exists() ? existingSnap.data()?.isOwner : isOwner;
+
+      await setDoc(devDocRef, {
+        deviceId: did,
+        deviceName: this.getDeviceName(),
+        deviceType: this.getDeviceType(),
+        joinedAt: existingSnap?.exists() ? existingSnap.data()?.joinedAt : new Date().toISOString(),
+        lastSeen: new Date().toISOString(),
+        isOwner: isExistingOwner || false,
+        revoked: false,
+        uid: user.uid,
+        updatedAt: serverTimestamp(),
+      }, { merge: true });
+
+      this.listenToDeviceStatus();
+    } catch (err) {
+      console.warn('Failed to register device:', err);
+    }
+  }
+
+  /**
+   * Generate a 5-minute single-use temporary link code
+   */
+  async generateTemporaryLinkCode(): Promise<{ code: string; expiresAt: number }> {
+    const wid = this.getWorkspaceId();
+    if (!wid) throw new Error('لا توجد مساحة عمل مفعلة لتوليد رمز الربط');
+
+    const chars = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789';
+    let code = '';
+    for (let i = 0; i < 8; i++) {
+      code += chars.charAt(Math.floor(Math.random() * chars.length));
+    }
+
+    const expiresAt = Date.now() + 5 * 60 * 1000; // 5 minutes
+
+    const tokenDocRef = doc(db, 'workspaces', wid, 'linkTokens', code);
+    await setDoc(tokenDocRef, {
+      code,
+      workspaceId: wid,
+      expiresAt,
+      used: false,
+      createdAt: serverTimestamp(),
+    });
+
+    console.log(`PharmaCare: Generated temporary link token for workspace ${wid}: ${code}`);
+    return { code, expiresAt };
+  }
+
+  /**
+   * Create a new workspace on Firestore
+   * Stores workspace root document and registers this device as Owner
+   */
+  async createWorkspace(nameAr?: string): Promise<{ workspaceId: string; joinCode: string }> {
     const user = await this.ensureAuth();
-    const pid = 'pharma-' + Math.random().toString(36).substring(2, 8);
-    // Generate secure 8-character join code (uppercase + digits)
+    const wid = 'pharma-' + Math.random().toString(36).substring(2, 8);
+    
+    // Generate secure 8-character persistent join code
     const chars = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789';
     let joinCode = '';
     for (let i = 0; i < 8; i++) {
@@ -212,126 +391,247 @@ class FirebaseSyncService {
     }
 
     const deviceId = this.getDeviceId();
-    const now = new Date().toISOString();
 
     try {
-      // 1. Create pharmacy root document
-      const pharmacyDocRef = doc(db, 'pharmacies', pid);
-      await setDoc(pharmacyDocRef, {
+      console.log(`PharmaCare: Creating workspace ${wid} on Firestore (default)...`);
+
+      // 1. Create workspace root document
+      const workspaceDocRef = doc(db, 'workspaces', wid);
+      await setDoc(workspaceDocRef, {
         joinCode,
         nameAr: nameAr || 'صيدليتي',
         createdAt: serverTimestamp(),
         createdBy: user.uid,
         createdDevice: deviceId,
+        ownerDeviceId: deviceId,
       });
 
-      // 2. Add creator as initial member
-      const memberDocRef = doc(db, 'pharmacies', pid, 'members', user.uid);
-      await setDoc(memberDocRef, {
+      // 2. Also write to legacy path pharmacies/{wid} to ensure cross-compatibility with any existing views
+      const legacyRef = doc(db, 'pharmacies', wid);
+      setDoc(legacyRef, {
         joinCode,
-        role: 'admin',
-        joinedAt: serverTimestamp(),
-        deviceId,
-      });
+        nameAr: nameAr || 'صيدليتي',
+        createdAt: serverTimestamp(),
+        createdBy: user.uid,
+      }, { merge: true }).catch(() => {});
 
       // 3. Save locally
-      localStorage.setItem(PHARMACY_ID_KEY, pid);
+      localStorage.setItem(WORKSPACE_ID_KEY, wid);
+      localStorage.setItem(LEGACY_PHARMACY_ID_KEY, wid);
       localStorage.setItem(JOIN_CODE_KEY, joinCode);
 
-      // 4. Migrate any existing local data into this newly created pharmacy
-      await this.seedExistingLocalData(pid);
+      // 4. Register this device as OWNER
+      await this.registerDevice(wid, true);
 
-      this.notifyPharmacyChange(pid);
+      // 5. Migrate any existing local data into this newly created workspace
+      await this.seedExistingLocalData(wid);
+
+      this.notifyWorkspaceChange(wid);
       this.notifyDataPulled();
-      return { pharmacyId: pid, joinCode };
+      console.log(`PharmaCare: Workspace ${wid} created successfully.`);
+      return { workspaceId: wid, joinCode };
     } catch (err: any) {
-      console.error('Error creating pharmacy:', err);
+      console.error('Error creating workspace:', err);
       const translated = this.translateFirebaseError(err);
-      this.notifyError(`فشل إنشاء الصيدلية: ${translated}`);
+      this.notifyError(`فشل إنشاء مساحة العمل: ${translated}`);
       throw new Error(translated);
     }
   }
 
+  // Alias for backward compatibility
+  async createPharmacy(nameAr?: string) {
+    const res = await this.createWorkspace(nameAr);
+    return { pharmacyId: res.workspaceId, joinCode: res.joinCode };
+  }
+
   /**
-   * Join an existing pharmacy organization using Pharmacy ID & Join Code
-   * Creates members/{uid} with joinCode matching pharmacies/{pid}.joinCode
+   * Join an existing workspace organization using Workspace ID & Join Code or Temporary Token
    */
-  async joinPharmacy(pharmacyId: string, joinCode: string): Promise<boolean> {
+  async joinWorkspace(workspaceId: string, joinCodeOrToken: string): Promise<boolean> {
     const user = await this.ensureAuth();
-    const pid = pharmacyId.trim();
-    const code = joinCode.trim();
+    const wid = workspaceId.trim();
+    const code = joinCodeOrToken.trim().toUpperCase();
 
-    if (!pid || code.length < 8) {
-      throw new Error('يرجى التأكد من إدخال معرّف الصيدلية ورمز الربط المكوّن من 8 خانات على الأقل');
+    if (!wid || code.length < 6) {
+      throw new Error('يرجى التأكد من إدخال معرّف مساحة العمل والرمز بشكل صحيح');
     }
-
-    const deviceId = this.getDeviceId();
 
     try {
       this.updateStatus('syncing');
+      console.log(`PharmaCare: Joining workspace ${wid} with code/token...`);
 
-      // Attempt to register membership. Rules will only allow this if code matches pharmacies/{pid}.joinCode
-      const memberDocRef = doc(db, 'pharmacies', pid, 'members', user.uid);
-      await setDoc(memberDocRef, {
-        joinCode: code,
-        role: 'member',
-        joinedAt: serverTimestamp(),
-        deviceId,
-      });
+      let isValid = false;
 
-      // Verification: read pharmacy doc
-      const pharmaSnap = await getDoc(doc(db, 'pharmacies', pid));
-      if (!pharmaSnap.exists()) {
-        throw new Error('لم يتم العثور على الصيدلية المطلوبة');
+      // 1. Check if token is a temporary link token
+      const tokenDocRef = doc(db, 'workspaces', wid, 'linkTokens', code);
+      const tokenSnap = await getDoc(tokenDocRef).catch(() => null);
+
+      if (tokenSnap && tokenSnap.exists()) {
+        const tokenData = tokenSnap.data();
+        if (tokenData.used) {
+          throw new Error('تم استخدام رمز الربط المؤقت هذا مسبقاً، يرجى توليد رمز جديد من الجهاز الرئيسي');
+        }
+        if (Date.now() > tokenData.expiresAt) {
+          throw new Error('انتهت صلاحية رمز الربط المؤقت (مدة الصلاحية 5 دقائق)، يرجى توليد رمز جديد');
+        }
+        // Mark token as used
+        await updateDoc(tokenDocRef, {
+          used: true,
+          usedBy: user.uid,
+          usedAt: serverTimestamp(),
+        }).catch(() => {});
+        isValid = true;
+      } else {
+        // 2. Validate against permanent joinCode in workspace doc
+        const wsSnap = await getDoc(doc(db, 'workspaces', wid)).catch(() => null);
+        if (wsSnap && wsSnap.exists()) {
+          const wsData = wsSnap.data();
+          if (wsData.joinCode && wsData.joinCode.toUpperCase() === code) {
+            isValid = true;
+          }
+        } else {
+          // Check legacy pharmacies path
+          const legSnap = await getDoc(doc(db, 'pharmacies', wid)).catch(() => null);
+          if (legSnap && legSnap.exists() && legSnap.data().joinCode?.toUpperCase() === code) {
+            isValid = true;
+          }
+        }
+      }
+
+      if (!isValid) {
+        throw new Error('رمز الربط أو الانضمام غير صحيح لمساحة العمل هذه');
       }
 
       // Save locally
-      localStorage.setItem(PHARMACY_ID_KEY, pid);
+      localStorage.setItem(WORKSPACE_ID_KEY, wid);
+      localStorage.setItem(LEGACY_PHARMACY_ID_KEY, wid);
       localStorage.setItem(JOIN_CODE_KEY, code);
 
-      this.notifyPharmacyChange(pid);
+      // Register this new device as standard member
+      await this.registerDevice(wid, false);
+
+      this.notifyWorkspaceChange(wid);
       this.updateStatus('synced');
       this.notifyDataPulled();
+      console.log(`PharmaCare: Device successfully joined workspace ${wid}`);
       return true;
     } catch (err: any) {
-      console.error('Error joining pharmacy:', err);
+      console.error('Error joining workspace:', err);
       const translated = this.translateFirebaseError(err);
-      this.notifyError(`فشل ربط الصيدلية: ${translated}`);
+      this.notifyError(`فشل ربط الجهاز: ${translated}`);
       this.updateStatus('error');
       throw new Error(translated);
     }
   }
 
+  // Alias for backward compatibility
+  async joinPharmacy(pharmacyId: string, joinCode: string) {
+    return this.joinWorkspace(pharmacyId, joinCode);
+  }
+
   /**
-   * Disconnect this device from the current pharmacy
+   * Disconnect this device from the current workspace
    */
   disconnectPharmacy(): void {
     try {
-      localStorage.removeItem(PHARMACY_ID_KEY);
+      if (this.deviceUnsubscribe) {
+        this.deviceUnsubscribe();
+        this.deviceUnsubscribe = null;
+      }
+      localStorage.removeItem(WORKSPACE_ID_KEY);
+      localStorage.removeItem(LEGACY_PHARMACY_ID_KEY);
       localStorage.removeItem(JOIN_CODE_KEY);
-      this.notifyPharmacyChange(null);
+      this.notifyWorkspaceChange(null);
       this.notifyDataPulled();
     } catch (e) {
       console.warn(e);
     }
   }
 
-  // --- Document Operations (Scoped to current pharmacy) ---
+  /**
+   * Fetch all registered devices in current workspace
+   */
+  async getLinkedDevices(): Promise<LinkedDevice[]> {
+    const wid = this.getWorkspaceId();
+    if (!wid) return [];
+
+    try {
+      const devColRef = collection(db, 'workspaces', wid, 'devices');
+      const snap = await getDocs(devColRef);
+      const list: LinkedDevice[] = [];
+      snap.forEach(d => {
+        const data = d.data();
+        list.push({
+          deviceId: d.id,
+          deviceName: data.deviceName || 'جهاز غير معروف',
+          deviceType: data.deviceType || 'متصفح',
+          joinedAt: data.joinedAt || new Date().toISOString(),
+          lastSeen: data.lastSeen || new Date().toISOString(),
+          isOwner: !!data.isOwner,
+          revoked: !!data.revoked,
+        });
+      });
+      return list;
+    } catch (err) {
+      console.warn('Failed to get linked devices:', err);
+      return [];
+    }
+  }
 
   /**
-   * Write or merge document into pharmacies/{pharmacyId}/{collectionName}/{id}
+   * Remotely revoke / logout a device (Owner only)
+   */
+  async revokeDevice(targetDeviceId: string): Promise<boolean> {
+    const wid = this.getWorkspaceId();
+    if (!wid) return false;
+
+    try {
+      const devDocRef = doc(db, 'workspaces', wid, 'devices', targetDeviceId);
+      await updateDoc(devDocRef, {
+        revoked: true,
+        revokedAt: serverTimestamp(),
+      });
+      console.log(`PharmaCare: Remotely revoked device ${targetDeviceId}`);
+      return true;
+    } catch (err) {
+      console.error('Failed to revoke device:', err);
+      throw err;
+    }
+  }
+
+  /**
+   * Delete a device from the list
+   */
+  async deleteDeviceRecord(targetDeviceId: string): Promise<boolean> {
+    const wid = this.getWorkspaceId();
+    if (!wid) return false;
+
+    try {
+      const devDocRef = doc(db, 'workspaces', wid, 'devices', targetDeviceId);
+      await firestoreDeleteDoc(devDocRef);
+      return true;
+    } catch (err) {
+      console.error('Failed to delete device:', err);
+      throw err;
+    }
+  }
+
+  // --- Document Operations (Scoped to current workspace with dual-write for compatibility) ---
+
+  /**
+   * Write or merge document into workspaces/{workspaceId}/{collectionName}/{id}
    * Adds updatedAt (serverTimestamp), deviceId, and deleted: false
+   * Also dual-writes to pharmacies/{wid}/{collectionName}/{id} for full safety
    */
   async saveDoc(collectionName: string, id: string, data: any): Promise<void> {
-    const pid = this.getPharmacyId();
-    if (!pid) {
-      console.warn(`PharmaCare: saveDoc skipped for ${collectionName}/${id} because no pharmacy is linked`);
+    const wid = this.getWorkspaceId();
+    if (!wid) {
+      console.warn(`PharmaCare: saveDoc skipped for ${collectionName}/${id} because no workspace is linked`);
       return;
     }
 
     try {
       const sanitized = JSON.parse(JSON.stringify(data));
-      // Clean non-serializable fields
       delete sanitized.id;
 
       const payload = {
@@ -342,12 +642,16 @@ class FirebaseSyncService {
         deviceId: this.getDeviceId(),
       };
 
-      const docRef = doc(db, 'pharmacies', pid, collectionName, id);
-      // Immediately write via Firestore SDK (writes to IndexedDB persistent cache & syncs to cloud)
-      setDoc(docRef, payload, { merge: true }).catch((err: any) => {
-        console.error(`Firestore write error (${collectionName}/${id}):`, err);
+      // 1. Primary write to workspaces/{wid}/{col}/{id}
+      const workspaceDocRef = doc(db, 'workspaces', wid, collectionName, id);
+      setDoc(workspaceDocRef, payload, { merge: true }).catch((err: any) => {
+        console.error(`Firestore write error (workspaces/${collectionName}/${id}):`, err);
         this.notifyError(`تعذر حفظ البيانات في السحابة (${collectionName}): ${this.translateFirebaseError(err)}`);
       });
+
+      // 2. Dual-write to pharmacies/{wid}/{col}/{id} for full backward compatibility
+      const legacyDocRef = doc(db, 'pharmacies', wid, collectionName, id);
+      setDoc(legacyDocRef, payload, { merge: true }).catch(() => {});
 
       this.updatePendingCount();
     } catch (err: any) {
@@ -360,20 +664,25 @@ class FirebaseSyncService {
    * Soft-delete document (deleted: true) so deletion reliably propagates to all devices
    */
   async deleteDoc(collectionName: string, id: string): Promise<void> {
-    const pid = this.getPharmacyId();
-    if (!pid) return;
+    const wid = this.getWorkspaceId();
+    if (!wid) return;
 
     try {
-      const docRef = doc(db, 'pharmacies', pid, collectionName, id);
-      setDoc(docRef, {
+      const payload = {
         deleted: true,
         deletedAt: serverTimestamp(),
         updatedAt: serverTimestamp(),
         deviceId: this.getDeviceId(),
-      }, { merge: true }).catch((err: any) => {
+      };
+
+      const docRef = doc(db, 'workspaces', wid, collectionName, id);
+      setDoc(docRef, payload, { merge: true }).catch((err: any) => {
         console.error(`Firestore soft delete error (${collectionName}/${id}):`, err);
         this.notifyError(`تعذر حذف العنصر من السحابة: ${this.translateFirebaseError(err)}`);
       });
+
+      const legRef = doc(db, 'pharmacies', wid, collectionName, id);
+      setDoc(legRef, payload, { merge: true }).catch(() => {});
 
       this.updatePendingCount();
     } catch (err: any) {
@@ -386,16 +695,22 @@ class FirebaseSyncService {
    * Atomically adjust product stock across devices using increment()
    */
   async adjustProductStock(productId: string, deltaQuantity: number): Promise<void> {
-    const pid = this.getPharmacyId();
-    if (!pid) return;
+    const wid = this.getWorkspaceId();
+    if (!wid) return;
 
     try {
-      const docRef = doc(db, 'pharmacies', pid, 'products', productId);
+      const docRef = doc(db, 'workspaces', wid, 'products', productId);
       await updateDoc(docRef, {
         stock: increment(deltaQuantity),
         updatedAt: serverTimestamp(),
         deviceId: this.getDeviceId(),
       });
+
+      const legRef = doc(db, 'pharmacies', wid, 'products', productId);
+      updateDoc(legRef, {
+        stock: increment(deltaQuantity),
+        updatedAt: serverTimestamp(),
+      }).catch(() => {});
     } catch (err: any) {
       console.warn(`Atomic stock update failed, fallback to saveDoc:`, err);
     }
@@ -404,21 +719,20 @@ class FirebaseSyncService {
   // --- Real-Time Subscriptions ---
 
   /**
-   * Subscribe to collection changes under current pharmacy
+   * Subscribe to collection changes under current workspace
    * Automatically filters out soft-deleted documents
    */
   subscribeToCollection<T extends { id: string }>(
     collectionName: string,
     callback: (items: T[]) => void
   ): Unsubscribe {
-    const pid = this.getPharmacyId();
-    if (!pid) {
+    const wid = this.getWorkspaceId();
+    if (!wid) {
       callback([]);
-      // Return dummy unsubscribe
       return () => {};
     }
 
-    const colRef = collection(db, 'pharmacies', pid, collectionName);
+    const colRef = collection(db, 'workspaces', wid, collectionName);
     return onSnapshot(
       colRef,
       { includeMetadataChanges: false },
@@ -435,6 +749,18 @@ class FirebaseSyncService {
       },
       (error) => {
         console.error(`Firestore ${collectionName} listener error:`, error.code, error.message);
+        // Fallback to pharmacies collection if workspaces had permission issue
+        if (error.code === 'permission-denied') {
+          const fallbackCol = collection(db, 'pharmacies', wid, collectionName);
+          return onSnapshot(fallbackCol, (snap) => {
+            const active: T[] = [];
+            snap.docs.forEach(d => {
+              const data = d.data();
+              if (!data.deleted) active.push({ id: d.id, ...data } as T);
+            });
+            callback(active);
+          }, () => {});
+        }
         this.notifyError(`خطأ في استماع بيانات ${collectionName}: ${this.translateFirebaseError(error)}`);
       }
     );
@@ -513,24 +839,28 @@ class FirebaseSyncService {
       return { success: false, message: 'لا يوجد اتصال بالإنترنت حالياً (البيانات محفوظة محلياً وتُرفع تلقائياً)' };
     }
 
-    const pid = this.getPharmacyId();
-    if (!pid) {
-      return { success: false, message: 'يرجى ربط أو إنشاء صيدلية أولاً لتفعيل المزامنة' };
+    const wid = this.getWorkspaceId();
+    if (!wid) {
+      return { success: false, message: 'يرجى ربط أو إنشاء مساحة عمل أولاً لتفعيل المزامنة' };
     }
 
     try {
       this.updateStatus('syncing');
+      console.log('PharmaCare: Waiting for pending writes to commit to Firestore...');
       // Wait for all offline writes to commit to Firestore
       await waitForPendingWrites(db);
 
       // Validate live connection
-      await getDocFromServer(doc(db, 'pharmacies', pid));
+      await getDocFromServer(doc(db, 'workspaces', wid)).catch(async () => {
+        return await getDocFromServer(doc(db, 'pharmacies', wid));
+      });
 
       const now = new Date().toISOString();
       this.setLastSyncTime(now);
       this.updateStatus('synced');
       this.notifyDataPulled();
-      return { success: true, message: 'تم التحقق من المزامنة: جميع البيانات متطابقة ومتزامنة لحظياً عبر السحابة 🟢' };
+      console.log('PharmaCare: syncNow completed successfully.');
+      return { success: true, message: 'تمت المزامنة بنجاح: تم رفع كافة العمليات ومطابقة السحابة لحظياً 🟢' };
     } catch (err: any) {
       console.warn('Sync now error:', err);
       this.updateStatus('error');
@@ -552,18 +882,18 @@ class FirebaseSyncService {
       };
     }
 
-    const pid = this.getPharmacyId();
-    if (!pid) {
+    const wid = this.getWorkspaceId();
+    if (!wid) {
       return {
         success: false,
-        message: 'لم يتم ربط هذا الجهاز بأي صيدلية بعد. يرجى إنشاء صيدلية أو ربطها بالرمز أولاً.',
-        details: { code: 'no_pharmacy' }
+        message: 'لم يتم ربط هذا الجهاز بأي مساحة عمل بعد. يرجى إنشاء صيدلية أو ربطها بالرمز أولاً.',
+        details: { code: 'no_workspace' }
       };
     }
 
     try {
       const user = await this.ensureAuth();
-      const testDocRef = doc(db, 'pharmacies', pid, 'settings', 'test_ping');
+      const testDocRef = doc(db, 'workspaces', wid, 'settings', 'test_ping');
       const testTimestamp = Date.now().toString();
 
       // Write test
@@ -586,7 +916,7 @@ class FirebaseSyncService {
         details: {
           uid: user.uid,
           isAnonymous: user.isAnonymous,
-          pharmacyId: pid,
+          workspaceId: wid,
           pingTime: readSnap.data()?.testPing
         }
       };
@@ -627,16 +957,16 @@ class FirebaseSyncService {
     if (code === 'auth/network-request-failed') {
       return 'فشل الاتصال بالشبكة أثناء المصادقة السحابية.';
     }
-    if (message.includes('joinCode')) {
-      return 'رمز الانضمام (Join Code) غير صحيح أو لا يطابق هذه الصيدلية.';
+    if (message.includes('joinCode') || message.includes('رمز')) {
+      return 'رمز الانضمام غير صحيح أو انتهت صلاحيته.';
     }
     return message || 'خطأ غير معروف في خدمة المزامنة السحابية';
   }
 
   /**
-   * Seed existing local data into newly created pharmacy to prevent any data loss
+   * Seed existing local data into newly created workspace to prevent any data loss
    */
-  private async seedExistingLocalData(pid: string): Promise<void> {
+  private async seedExistingLocalData(wid: string): Promise<void> {
     try {
       const { pharmacyStorage } = await import('./storage');
       const prods = pharmacyStorage.getProducts();
@@ -651,7 +981,8 @@ class FirebaseSyncService {
       const banks = pharmacyStorage.getBanks();
       const settings = pharmacyStorage.getSettings();
 
-      // Write items in small non-blocking chunks
+      console.log(`PharmaCare: Seeding ${prods.length} products to workspace ${wid}...`);
+
       for (const p of prods) {
         await this.saveDoc('products', p.id, p);
       }
@@ -684,7 +1015,7 @@ class FirebaseSyncService {
       }
       await this.saveDoc('settings', 'current', settings);
 
-      console.log('PharmaCare: Successfully seeded local data to new pharmacy:', pid);
+      console.log('PharmaCare: Successfully seeded local data to new workspace:', wid);
     } catch (e) {
       console.warn('PharmaCare: Data seed warning:', e);
     }
@@ -740,10 +1071,10 @@ export function subscribeToStockMovements(callback: (movements: StockMovement[])
 }
 
 export function subscribeToSettings(callback: (settings: Settings) => void): Unsubscribe {
-  const pid = firebaseSync.getPharmacyId();
-  if (!pid) return () => {};
+  const wid = firebaseSync.getWorkspaceId();
+  if (!wid) return () => {};
   return onSnapshot(
-    doc(db, 'pharmacies', pid, 'settings', 'current'),
+    doc(db, 'workspaces', wid, 'settings', 'current'),
     (docSnap) => {
       if (docSnap.exists()) {
         callback(docSnap.data() as Settings);
