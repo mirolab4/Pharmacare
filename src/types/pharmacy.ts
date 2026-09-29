@@ -268,14 +268,18 @@ export interface StockMovement {
   balanceAfter: number;
 }
 
+export type MemberRole = 'owner' | 'admin' | 'cashier' | 'viewer';
+
 export interface LinkedDevice {
   deviceId: string;
   deviceName: string;
   deviceType: string;
+  role?: MemberRole;
   joinedAt: string;
   lastSeen: string;
   isOwner?: boolean;
   revoked?: boolean;
+  uid?: string;
 }
 
 export type MainTab = 

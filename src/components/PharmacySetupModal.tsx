@@ -279,10 +279,10 @@ export const PharmacySetupModal: React.FC<PharmacySetupModalProps> = ({
                   <input
                     type="text"
                     required
-                    placeholder="رمز من 8 خانات (مثال: PK7M9X2Q)"
+                    placeholder="رمز رقمي مكوّن من 6 أرقام (مثال: 729401)"
                     value={inputJoinCode}
-                    onChange={(e) => setInputJoinCode(e.target.value.toUpperCase())}
-                    className="w-full px-4 py-3 rounded-xl border border-slate-200 dark:border-slate-700 bg-slate-50 dark:bg-slate-800 text-slate-900 dark:text-white font-mono text-sm tracking-widest uppercase focus:ring-2 focus:ring-sky-500 outline-none transition-all"
+                    onChange={(e) => setInputJoinCode(e.target.value.trim())}
+                    className="w-full px-4 py-3 rounded-xl border border-slate-200 dark:border-slate-700 bg-slate-50 dark:bg-slate-800 text-slate-900 dark:text-white font-mono text-base tracking-widest text-center focus:ring-2 focus:ring-sky-500 outline-none transition-all"
                   />
                   <KeyRound className="w-4 h-4 text-slate-400 absolute left-3 top-3.5" />
                 </div>

@@ -57,6 +57,7 @@ import {
 } from './types/pharmacy';
 import { playBeep, playSuccess, playError } from './utils/audio';
 import { useHardwareBarcodeScanner } from './utils/useHardwareBarcodeScanner';
+import { Loader2, AlertTriangle, CheckCircle2 } from 'lucide-react';
 
 const VALID_TABS: MainTab[] = [
   'pos', 'sales_returns', 'purchases', 'purchase_returns', 
@@ -64,21 +65,30 @@ const VALID_TABS: MainTab[] = [
   'invoices', 'vouchers', 'analytics', 'settings'
 ];
 
-function getUrlParams(): { pid?: string; code?: string } {
+function getUrlParams(): { wid?: string; code?: string; slug?: string } {
   if (typeof window === 'undefined') return {};
-  const searchParams = new URLSearchParams(window.location.search);
-  let pid = searchParams.get('pid') || undefined;
-  let code = searchParams.get('code') || undefined;
 
-  if ((!pid || !code) && window.location.hash.includes('?')) {
+  const extract = (search: string) => {
+    const params = new URLSearchParams(search);
+    const wid = params.get('w') || params.get('wid') || params.get('workspaceId') || params.get('pid') || params.get('pharmacyId') || undefined;
+    const code = params.get('code') || params.get('token') || params.get('joinCode') || params.get('k') || undefined;
+    const slug = params.get('slug') || params.get('name') || undefined;
+    return { wid, code, slug };
+  };
+
+  let res = extract(window.location.search);
+  if ((!res.wid || !res.code) && window.location.hash.includes('?')) {
     const hashQuery = window.location.hash.split('?')[1];
     if (hashQuery) {
-      const hashParams = new URLSearchParams(hashQuery);
-      pid = pid || hashParams.get('pid') || undefined;
-      code = code || hashParams.get('code') || undefined;
+      const hashRes = extract(hashQuery);
+      res = {
+        wid: res.wid || hashRes.wid,
+        code: res.code || hashRes.code,
+        slug: res.slug || hashRes.slug,
+      };
     }
   }
-  return { pid, code };
+  return res;
 }
 
 function getTabFromHash(): MainTab {
@@ -138,9 +148,69 @@ export default function App() {
 
   // URL Params & Multi-Device Pharmacy Setup Modal
   const [urlParams] = useState(() => getUrlParams());
+  const [isAutoJoining, setIsAutoJoining] = useState<boolean>(false);
+  const [autoJoinError, setAutoJoinError] = useState<string | null>(null);
+  const [revokedNotice, setRevokedNotice] = useState<boolean>(false);
+
   const [isPharmacySetupOpen, setIsPharmacySetupOpen] = useState<boolean>(() => {
-    return !firebaseSync.isLinked() || !!(urlParams.pid && urlParams.code);
+    return !firebaseSync.isLinked() && !urlParams.wid;
   });
+
+  // Automatic Join when scanning QR Code URL
+  useEffect(() => {
+    const { wid, code } = urlParams;
+    if (wid && code) {
+      const currentWid = firebaseSync.getWorkspaceId();
+      if (currentWid === wid) {
+        setIsPharmacySetupOpen(false);
+        const cleanUrl = window.location.origin + window.location.pathname + '#/pos';
+        window.history.replaceState({}, document.title, cleanUrl);
+        return;
+      }
+
+      setIsAutoJoining(true);
+      setAutoJoinError(null);
+      console.log(`PharmaCare: Auto-joining workspace ${wid} via URL barcode parameters...`);
+
+      firebaseSync.joinWorkspace(wid, code)
+        .then(() => {
+          playSuccess();
+          setIsAutoJoining(false);
+          setIsPharmacySetupOpen(false);
+          refreshAllState();
+          const cleanUrl = window.location.origin + window.location.pathname + '#/pos';
+          window.history.replaceState({}, document.title, cleanUrl);
+        })
+        .catch((err: any) => {
+          console.error('Auto join failed:', err);
+          playError();
+          setIsAutoJoining(false);
+          setAutoJoinError(err.message || 'فشل الانضمام التلقائي عبر الباركود');
+          setIsPharmacySetupOpen(true);
+        });
+    }
+  }, [urlParams, refreshAllState]);
+
+  // Listen to remote expulsion / membership revocation
+  useEffect(() => {
+    const unsubRevoked = firebaseSync.onDeviceRevoked(() => {
+      playError();
+      setRevokedNotice(true);
+      setIsPharmacySetupOpen(true);
+      refreshAllState();
+    });
+    return () => unsubRevoked();
+  }, [refreshAllState]);
+
+  // Heartbeat interval (updates lastSeen every 2 minutes when online)
+  useEffect(() => {
+    const interval = setInterval(() => {
+      if (typeof navigator !== 'undefined' && navigator.onLine) {
+        firebaseSync.updateHeartbeat().catch(() => {});
+      }
+    }, 2 * 60 * 1000);
+    return () => clearInterval(interval);
+  }, []);
 
   const handleOpenCustomerDisplay = () => {
     if (typeof window !== 'undefined') {
@@ -756,14 +826,61 @@ export default function App() {
 
       {/* First-Launch / Multi-Device Pharmacy Setup Modal */}
       <PharmacySetupModal
-        isOpen={isPharmacySetupOpen}
+        isOpen={isPharmacySetupOpen && !isAutoJoining}
         onSuccess={() => {
           setIsPharmacySetupOpen(false);
           refreshAllState();
         }}
-        initialPharmacyId={urlParams.pid || ''}
+        initialPharmacyId={urlParams.wid || ''}
         initialJoinCode={urlParams.code || ''}
       />
+
+      {/* Auto-Joining Splash Overlay on Barcode Scan */}
+      {isAutoJoining && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-slate-950/80 backdrop-blur-md p-4" dir="rtl">
+          <div className="w-full max-w-sm rounded-3xl bg-white dark:bg-slate-900 p-6 shadow-2xl border border-slate-200 dark:border-slate-800 text-center space-y-4 animate-in zoom-in-95 duration-200">
+            <div className="w-16 h-16 bg-sky-50 dark:bg-sky-950/60 rounded-2xl flex items-center justify-center mx-auto text-sky-600">
+              <Loader2 className="w-8 h-8 animate-spin" />
+            </div>
+            <h4 className="font-extrabold text-slate-900 dark:text-white text-base">
+              جارٍ ربط هذا الجهاز بالصيدلية تلقائياً...
+            </h4>
+            <p className="text-xs text-slate-500 dark:text-slate-400">
+              تم اكتشاف باركود الربط. يتم الآن تهيئة الاتصال ومزامنة الأصناف ومخزون الأدوية.
+            </p>
+            {autoJoinError && (
+              <div className="p-3 rounded-xl bg-rose-50 dark:bg-rose-950/50 border border-rose-200 text-rose-700 dark:text-rose-300 text-xs font-bold">
+                {autoJoinError}
+              </div>
+            )}
+          </div>
+        </div>
+      )}
+
+      {/* Expulsion / Remote Logout Notice Modal */}
+      {revokedNotice && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-slate-950/85 backdrop-blur-md p-4" dir="rtl">
+          <div className="w-full max-w-md rounded-3xl bg-white dark:bg-slate-900 p-6 shadow-2xl border border-rose-200 dark:border-rose-900/60 text-center space-y-4 animate-in zoom-in-95 duration-200">
+            <div className="w-16 h-16 bg-rose-100 dark:bg-rose-950 rounded-2xl flex items-center justify-center mx-auto text-rose-600">
+              <AlertTriangle className="w-8 h-8" />
+            </div>
+            <h4 className="font-extrabold text-slate-900 dark:text-white text-base">
+              تم إنهاء صلاحية هذا الجهاز عن بُعد 🚫
+            </h4>
+            <p className="text-xs text-slate-600 dark:text-slate-400 leading-relaxed">
+              قام مالك أو مسؤول الصيدلية بحذف أو طرد هذا الجهاز من قائمة الأجهزة المصرح لها (Members).
+              تم مسح بيانات الدخول السحابية لحماية الصيدلية والعودة لشاشة البداية.
+            </p>
+            <button
+              type="button"
+              onClick={() => setRevokedNotice(false)}
+              className="w-full py-3 px-4 rounded-xl bg-rose-600 hover:bg-rose-700 text-white font-bold text-xs shadow-md transition-all"
+            >
+              فهمت، الانتقال لشاشة البداية
+            </button>
+          </div>
+        </div>
+      )}
 
       {/* Quick Mobile Camera Stock Audit Modal */}
       <QuickStockAuditModal

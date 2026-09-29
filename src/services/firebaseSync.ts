@@ -171,6 +171,17 @@ class FirebaseSyncService {
     }
   }
 
+  /**
+   * Generate secure numeric code (digits only 0-9)
+   */
+  generateNumericCode(length = 6): string {
+    let code = '';
+    for (let i = 0; i < length; i++) {
+      code += Math.floor(Math.random() * 10).toString();
+    }
+    return code;
+  }
+
   getDeviceName(): string {
     try {
       let name = localStorage.getItem(DEVICE_NAME_KEY);
@@ -297,7 +308,7 @@ class FirebaseSyncService {
   }
 
   /**
-   * Listen to current device document in workspace to handle remote logout
+   * Listen to current device member document in workspace to handle remote logout & expulsion
    */
   private listenToDeviceStatus() {
     if (this.deviceUnsubscribe) {
@@ -309,19 +320,39 @@ class FirebaseSyncService {
     const did = this.getDeviceId();
     if (!wid || !did) return;
 
+    let hasInitiallyLoaded = false;
+
     try {
-      const devDocRef = doc(db, 'workspaces', wid, 'devices', did);
-      this.deviceUnsubscribe = onSnapshot(devDocRef, (snap) => {
-        if (snap.exists()) {
-          const data = snap.data();
-          if (data?.revoked === true) {
-            console.warn('PharmaCare: This device has been remotely revoked by owner. Disconnecting...');
-            this.disconnectPharmacy();
-            this.notifyDeviceRevoked();
+      const memberDocRef = doc(db, 'workspaces', wid, 'members', did);
+      this.deviceUnsubscribe = onSnapshot(memberDocRef, (snap) => {
+        if (!hasInitiallyLoaded) {
+          hasInitiallyLoaded = true;
+          // If member doc doesn't exist yet on initial registration, don't immediately expel
+          if (!snap.exists()) {
+            return;
           }
         }
+
+        // Remote Expulsion: If member document was deleted OR marked revoked: true
+        if (!snap.exists() || snap.data()?.revoked === true) {
+          console.warn('PharmaCare: Membership document was deleted or revoked by owner. Expelling device...');
+          this.disconnectPharmacy();
+          this.notifyDeviceRevoked();
+          return;
+        }
+
+        const data = snap.data();
+        if (data?.role) {
+          console.log(`PharmaCare: Current device role is [${data.role}]`);
+        }
       }, (err) => {
-        console.warn('Device listener warning:', err.message);
+        console.warn('Member listener warning:', err.message);
+        // If permission-denied occurred because the rules denied access to non-members
+        if (err.message.includes('permission-denied') || (err as any).code === 'permission-denied') {
+          console.warn('PharmaCare: Permission denied for member, disconnecting...');
+          this.disconnectPharmacy();
+          this.notifyDeviceRevoked();
+        }
       });
     } catch (e) {
       console.warn(e);
@@ -329,61 +360,94 @@ class FirebaseSyncService {
   }
 
   /**
-   * Register or update this device under workspaces/{wid}/devices/{deviceId}
+   * Register or update this device under workspaces/{wid}/members/{deviceId}
+   * and dual-write to legacy devices/{deviceId}
    */
-  async registerDevice(wid: string, isOwner = false): Promise<void> {
+  async registerDevice(wid: string, isOwner = false, role?: MemberRole): Promise<void> {
     try {
       const user = await this.ensureAuth();
       const did = this.getDeviceId();
-      const devDocRef = doc(db, 'workspaces', wid, 'devices', did);
+      const memberDocRef = doc(db, 'workspaces', wid, 'members', did);
+      const legacyDevDocRef = doc(db, 'workspaces', wid, 'devices', did);
       
-      const existingSnap = await getDoc(devDocRef).catch(() => null);
-      const isExistingOwner = existingSnap?.exists() ? existingSnap.data()?.isOwner : isOwner;
+      const existingSnap = await getDoc(memberDocRef).catch(() => null);
+      const existingData = existingSnap?.exists() ? existingSnap.data() : null;
+      const isExistingOwner = existingData ? existingData.isOwner : isOwner;
+      const determinedRole: MemberRole = isExistingOwner || isOwner 
+        ? 'owner' 
+        : (role || existingData?.role || 'cashier');
 
-      await setDoc(devDocRef, {
+      const payload = {
         deviceId: did,
         deviceName: this.getDeviceName(),
         deviceType: this.getDeviceType(),
-        joinedAt: existingSnap?.exists() ? existingSnap.data()?.joinedAt : new Date().toISOString(),
+        role: determinedRole,
+        joinedAt: existingData ? existingData.joinedAt : new Date().toISOString(),
         lastSeen: new Date().toISOString(),
-        isOwner: isExistingOwner || false,
+        isOwner: isExistingOwner || isOwner || false,
         revoked: false,
         uid: user.uid,
         updatedAt: serverTimestamp(),
-      }, { merge: true });
+      };
+
+      // 1. Primary: Save in members collection
+      await setDoc(memberDocRef, payload, { merge: true });
+
+      // 2. Legacy: Dual-write to devices collection
+      setDoc(legacyDevDocRef, payload, { merge: true }).catch(() => {});
 
       this.listenToDeviceStatus();
     } catch (err) {
-      console.warn('Failed to register device:', err);
+      console.warn('Failed to register member device:', err);
     }
   }
 
   /**
-   * Generate a 5-minute single-use temporary link code
+   * Update heartbeat lastSeen timestamp on this device's member record
    */
-  async generateTemporaryLinkCode(): Promise<{ code: string; expiresAt: number }> {
+  async updateHeartbeat(): Promise<void> {
+    const wid = this.getWorkspaceId();
+    const did = this.getDeviceId();
+    if (!wid || !did) return;
+
+    try {
+      const memberDocRef = doc(db, 'workspaces', wid, 'members', did);
+      await updateDoc(memberDocRef, {
+        lastSeen: new Date().toISOString(),
+        updatedAt: serverTimestamp()
+      }).catch(() => {});
+    } catch (e) {
+      // Non-blocking
+    }
+  }
+
+  /**
+   * Generate a configurable numeric link code
+   * expiresInMinutes: 5, 15, 60, 1440, or <= 0 for permanent
+   */
+  async generateTemporaryLinkCode(expiresInMinutes = 5): Promise<{ code: string; expiresAt: number; isPermanent: boolean }> {
     const wid = this.getWorkspaceId();
     if (!wid) throw new Error('لا توجد مساحة عمل مفعلة لتوليد رمز الربط');
 
-    const chars = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789';
-    let code = '';
-    for (let i = 0; i < 8; i++) {
-      code += chars.charAt(Math.floor(Math.random() * chars.length));
-    }
-
-    const expiresAt = Date.now() + 5 * 60 * 1000; // 5 minutes
+    // 6-digit numeric code
+    const code = this.generateNumericCode(6);
+    const isPermanent = expiresInMinutes <= 0;
+    const expiresAt = isPermanent 
+      ? Date.now() + 10 * 365 * 24 * 3600 * 1000 
+      : Date.now() + expiresInMinutes * 60 * 1000;
 
     const tokenDocRef = doc(db, 'workspaces', wid, 'linkTokens', code);
     await setDoc(tokenDocRef, {
       code,
       workspaceId: wid,
       expiresAt,
+      isPermanent,
       used: false,
       createdAt: serverTimestamp(),
     });
 
-    console.log(`PharmaCare: Generated temporary link token for workspace ${wid}: ${code}`);
-    return { code, expiresAt };
+    console.log(`PharmaCare: Generated numeric link token for workspace ${wid}: ${code} (Expires: ${isPermanent ? 'Permanent' : expiresInMinutes + 'm'})`);
+    return { code, expiresAt, isPermanent };
   }
 
   /**
@@ -394,13 +458,8 @@ class FirebaseSyncService {
     const user = await this.ensureAuth();
     const wid = 'pharma-' + Math.random().toString(36).substring(2, 8);
     
-    // Generate secure 8-character persistent join code
-    const chars = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789';
-    let joinCode = '';
-    for (let i = 0; i < 8; i++) {
-      joinCode += chars.charAt(Math.floor(Math.random() * chars.length));
-    }
-
+    // Generate secure 6-digit numeric persistent join code
+    const joinCode = this.generateNumericCode(6);
     const deviceId = this.getDeviceId();
 
     try {
@@ -431,15 +490,15 @@ class FirebaseSyncService {
       localStorage.setItem(LEGACY_PHARMACY_ID_KEY, wid);
       localStorage.setItem(JOIN_CODE_KEY, joinCode);
 
-      // 4. Register this device as OWNER
-      await this.registerDevice(wid, true);
+      // 4. Register this device as OWNER in members collection
+      await this.registerDevice(wid, true, 'owner');
 
       // 5. Migrate any existing local data into this newly created workspace
       await this.seedExistingLocalData(wid);
 
       this.notifyWorkspaceChange(wid);
       this.notifyDataPulled();
-      console.log(`PharmaCare: Workspace ${wid} created successfully.`);
+      console.log(`PharmaCare: Workspace ${wid} created successfully with numeric code: ${joinCode}`);
       return { workspaceId: wid, joinCode };
     } catch (err: any) {
       console.error('Error creating workspace:', err);
@@ -463,13 +522,13 @@ class FirebaseSyncService {
     const wid = workspaceId.trim();
     const code = joinCodeOrToken.trim().toUpperCase();
 
-    if (!wid || code.length < 6) {
+    if (!wid || code.length < 4) {
       throw new Error('يرجى التأكد من إدخال معرّف مساحة العمل والرمز بشكل صحيح');
     }
 
     try {
       this.updateStatus('syncing');
-      console.log(`PharmaCare: Joining workspace ${wid} with code/token...`);
+      console.log(`PharmaCare: Joining workspace ${wid} with code/token [${code}]...`);
 
       let isValid = false;
 
@@ -479,31 +538,33 @@ class FirebaseSyncService {
 
       if (tokenSnap && tokenSnap.exists()) {
         const tokenData = tokenSnap.data();
-        if (tokenData.used) {
-          throw new Error('تم استخدام رمز الربط المؤقت هذا مسبقاً، يرجى توليد رمز جديد من الجهاز الرئيسي');
+        if (tokenData.used && !tokenData.isPermanent) {
+          throw new Error('تم استخدام رمز الربط المؤقت هذا مسبقاً، يرجى طلب رمز جديد من المالك');
         }
-        if (Date.now() > tokenData.expiresAt) {
-          throw new Error('انتهت صلاحية رمز الربط المؤقت (مدة الصلاحية 5 دقائق)، يرجى توليد رمز جديد');
+        if (!tokenData.isPermanent && Date.now() > tokenData.expiresAt) {
+          throw new Error('انتهت صلاحية رمز الربط، يرجى طلب توليد رمز جديد من المالك');
         }
-        // Mark token as used
-        await updateDoc(tokenDocRef, {
-          used: true,
-          usedBy: user.uid,
-          usedAt: serverTimestamp(),
-        }).catch(() => {});
+        // Mark token as used if not permanent
+        if (!tokenData.isPermanent) {
+          await updateDoc(tokenDocRef, {
+            used: true,
+            usedBy: user.uid,
+            usedAt: serverTimestamp(),
+          }).catch(() => {});
+        }
         isValid = true;
       } else {
         // 2. Validate against permanent joinCode in workspace doc
         const wsSnap = await getDoc(doc(db, 'workspaces', wid)).catch(() => null);
         if (wsSnap && wsSnap.exists()) {
           const wsData = wsSnap.data();
-          if (wsData.joinCode && wsData.joinCode.toUpperCase() === code) {
+          if (wsData.joinCode && wsData.joinCode.toString().trim() === code) {
             isValid = true;
           }
         } else {
           // Check legacy pharmacies path
           const legSnap = await getDoc(doc(db, 'pharmacies', wid)).catch(() => null);
-          if (legSnap && legSnap.exists() && legSnap.data().joinCode?.toUpperCase() === code) {
+          if (legSnap && legSnap.exists() && legSnap.data().joinCode?.toString().trim() === code) {
             isValid = true;
           }
         }
@@ -518,13 +579,13 @@ class FirebaseSyncService {
       localStorage.setItem(LEGACY_PHARMACY_ID_KEY, wid);
       localStorage.setItem(JOIN_CODE_KEY, code);
 
-      // Register this new device as standard member
-      await this.registerDevice(wid, false);
+      // Register this new device as standard cashier member (joining member cannot assign their own role)
+      await this.registerDevice(wid, false, 'cashier');
 
       this.notifyWorkspaceChange(wid);
       this.updateStatus('synced');
       this.notifyDataPulled();
-      console.log(`PharmaCare: Device successfully joined workspace ${wid}`);
+      console.log(`PharmaCare: Device successfully joined workspace ${wid} as cashier`);
       return true;
     } catch (err: any) {
       console.error('Error joining workspace:', err);
@@ -560,26 +621,123 @@ class FirebaseSyncService {
   }
 
   /**
-   * Fetch all registered devices in current workspace
+   * Rotate the workspace joinCode automatically to prevent expelled devices from re-entering
+   */
+  async rotateJoinCode(wid?: string): Promise<string> {
+    const targetWid = wid || this.getWorkspaceId();
+    if (!targetWid) throw new Error('لا توجد مساحة عمل مفعلة لتدوير الرمز');
+
+    const newCode = this.generateNumericCode(6);
+    try {
+      const wsRef = doc(db, 'workspaces', targetWid);
+      await updateDoc(wsRef, {
+        joinCode: newCode,
+        updatedAt: serverTimestamp(),
+      });
+
+      // Update legacy path as well
+      const legRef = doc(db, 'pharmacies', targetWid);
+      updateDoc(legRef, {
+        joinCode: newCode,
+        updatedAt: serverTimestamp(),
+      }).catch(() => {});
+
+      localStorage.setItem(JOIN_CODE_KEY, newCode);
+      this.notifyWorkspaceChange(targetWid);
+      console.log(`PharmaCare: Successfully rotated joinCode for ${targetWid} to: ${newCode}`);
+      return newCode;
+    } catch (err) {
+      console.error('Failed to rotate join code:', err);
+      throw err;
+    }
+  }
+
+  /**
+   * Realtime subscription to workspace members list (from collection members)
+   */
+  subscribeToMembers(callback: (members: LinkedDevice[]) => void): Unsubscribe {
+    const wid = this.getWorkspaceId();
+    if (!wid) {
+      callback([]);
+      return () => {};
+    }
+
+    const membersColRef = collection(db, 'workspaces', wid, 'members');
+    return onSnapshot(membersColRef, (snap) => {
+      if (snap.empty) {
+        // Fallback to devices collection for existing data
+        this.getLinkedDevices().then(callback).catch(() => callback([]));
+        return;
+      }
+      const list: LinkedDevice[] = [];
+      snap.forEach(d => {
+        const data = d.data();
+        list.push({
+          deviceId: d.id,
+          deviceName: data.deviceName || 'جهاز كاشير',
+          deviceType: data.deviceType || 'متصفح',
+          role: data.role || (data.isOwner ? 'owner' : 'cashier'),
+          joinedAt: data.joinedAt || new Date().toISOString(),
+          lastSeen: data.lastSeen || new Date().toISOString(),
+          isOwner: !!data.isOwner || data.role === 'owner',
+          revoked: !!data.revoked,
+          uid: data.uid,
+        });
+      });
+      callback(list);
+    }, (err) => {
+      console.warn('Members subscription error:', err.message);
+      // Fallback
+      this.getLinkedDevices().then(callback).catch(() => callback([]));
+    });
+  }
+
+  /**
+   * Fetch all registered members / devices in current workspace
    */
   async getLinkedDevices(): Promise<LinkedDevice[]> {
     const wid = this.getWorkspaceId();
     if (!wid) return [];
 
     try {
+      // Check members first
+      const memColRef = collection(db, 'workspaces', wid, 'members');
+      const snap = await getDocs(memColRef);
+      if (!snap.empty) {
+        const list: LinkedDevice[] = [];
+        snap.forEach(d => {
+          const data = d.data();
+          list.push({
+            deviceId: d.id,
+            deviceName: data.deviceName || 'جهاز غير معروف',
+            deviceType: data.deviceType || 'متصفح',
+            role: data.role || (data.isOwner ? 'owner' : 'cashier'),
+            joinedAt: data.joinedAt || new Date().toISOString(),
+            lastSeen: data.lastSeen || new Date().toISOString(),
+            isOwner: !!data.isOwner || data.role === 'owner',
+            revoked: !!data.revoked,
+            uid: data.uid,
+          });
+        });
+        return list;
+      }
+
+      // Fallback to devices
       const devColRef = collection(db, 'workspaces', wid, 'devices');
-      const snap = await getDocs(devColRef);
+      const devSnap = await getDocs(devColRef);
       const list: LinkedDevice[] = [];
-      snap.forEach(d => {
+      devSnap.forEach(d => {
         const data = d.data();
         list.push({
           deviceId: d.id,
           deviceName: data.deviceName || 'جهاز غير معروف',
           deviceType: data.deviceType || 'متصفح',
+          role: data.isOwner ? 'owner' : 'cashier',
           joinedAt: data.joinedAt || new Date().toISOString(),
           lastSeen: data.lastSeen || new Date().toISOString(),
           isOwner: !!data.isOwner,
           revoked: !!data.revoked,
+          uid: data.uid,
         });
       });
       return list;
@@ -590,20 +748,32 @@ class FirebaseSyncService {
   }
 
   /**
-   * Remotely revoke / logout a device (Owner only)
+   * Remotely revoke / logout a member device and immediately rotate the join code
    */
-  async revokeDevice(targetDeviceId: string): Promise<boolean> {
+  async revokeDevice(targetDeviceId: string): Promise<{ success: boolean; newJoinCode: string }> {
     const wid = this.getWorkspaceId();
-    if (!wid) return false;
+    if (!wid) throw new Error('لا توجد مساحة عمل مفعلة');
 
     try {
+      // 1. Mark revoked in members
+      const memDocRef = doc(db, 'workspaces', wid, 'members', targetDeviceId);
+      await updateDoc(memDocRef, {
+        revoked: true,
+        revokedAt: serverTimestamp(),
+        updatedAt: serverTimestamp(),
+      }).catch(() => {});
+
+      // 2. Mark revoked in legacy devices
       const devDocRef = doc(db, 'workspaces', wid, 'devices', targetDeviceId);
       await updateDoc(devDocRef, {
         revoked: true,
         revokedAt: serverTimestamp(),
-      });
-      console.log(`PharmaCare: Remotely revoked device ${targetDeviceId}`);
-      return true;
+      }).catch(() => {});
+
+      // 3. Immediately rotate join code!
+      const newJoinCode = await this.rotateJoinCode(wid);
+      console.log(`PharmaCare: Remotely revoked device ${targetDeviceId} and rotated code to ${newJoinCode}`);
+      return { success: true, newJoinCode };
     } catch (err) {
       console.error('Failed to revoke device:', err);
       throw err;
@@ -611,18 +781,49 @@ class FirebaseSyncService {
   }
 
   /**
-   * Delete a device from the list
+   * Delete a member document completely (cuts off access immediately) and rotate join code
    */
-  async deleteDeviceRecord(targetDeviceId: string): Promise<boolean> {
+  async deleteDeviceRecord(targetDeviceId: string): Promise<{ success: boolean; newJoinCode: string }> {
     const wid = this.getWorkspaceId();
-    if (!wid) return false;
+    if (!wid) throw new Error('لا توجد مساحة عمل مفعلة');
 
     try {
+      // 1. Delete from members collection
+      const memDocRef = doc(db, 'workspaces', wid, 'members', targetDeviceId);
+      await firestoreDeleteDoc(memDocRef).catch(() => {});
+
+      // 2. Delete from devices collection
       const devDocRef = doc(db, 'workspaces', wid, 'devices', targetDeviceId);
-      await firestoreDeleteDoc(devDocRef);
+      await firestoreDeleteDoc(devDocRef).catch(() => {});
+
+      // 3. Immediately rotate join code!
+      const newJoinCode = await this.rotateJoinCode(wid);
+      console.log(`PharmaCare: Deleted member ${targetDeviceId} and rotated code to ${newJoinCode}`);
+      return { success: true, newJoinCode };
+    } catch (err) {
+      console.error('Failed to delete member device:', err);
+      throw err;
+    }
+  }
+
+  /**
+   * Update role for a member device (Admin / Owner only)
+   */
+  async updateMemberRole(targetDeviceId: string, newRole: MemberRole): Promise<boolean> {
+    const wid = this.getWorkspaceId();
+    if (!wid) throw new Error('لا توجد مساحة عمل مفعلة');
+
+    try {
+      const memDocRef = doc(db, 'workspaces', wid, 'members', targetDeviceId);
+      await updateDoc(memDocRef, {
+        role: newRole,
+        isOwner: newRole === 'owner',
+        updatedAt: serverTimestamp(),
+      });
+      console.log(`PharmaCare: Updated role for ${targetDeviceId} to ${newRole}`);
       return true;
     } catch (err) {
-      console.error('Failed to delete device:', err);
+      console.error('Failed to update member role:', err);
       throw err;
     }
   }
@@ -1096,3 +1297,8 @@ export function subscribeToSettings(callback: (settings: Settings) => void): Uns
     }
   );
 }
+
+export function subscribeToMembers(callback: (members: LinkedDevice[]) => void): Unsubscribe {
+  return firebaseSync.subscribeToMembers(callback);
+}
+
