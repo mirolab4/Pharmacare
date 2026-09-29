@@ -111,7 +111,7 @@ class FirebaseSyncService {
     }
 
     // Auto sign-in anonymously without any login screens
-    this.authInitPromise = new Promise((resolve) => {
+    this.authInitPromise = new Promise((resolve, reject) => {
       onAuthStateChanged(auth, async (user) => {
         if (user) {
           console.log('PharmaCare Anonymous Auth Success. UID:', user.uid);
@@ -131,6 +131,7 @@ class FirebaseSyncService {
           } catch (err: any) {
             console.error('PharmaCare Anonymous Auth Error:', err);
             this.notifyError(this.translateFirebaseError(err));
+            reject(err);
           }
         }
       });
@@ -282,7 +283,17 @@ class FirebaseSyncService {
 
   async ensureAuth(): Promise<User> {
     if (this.currentUser) return this.currentUser;
-    return this.authInitPromise;
+    if (auth.currentUser) {
+      this.currentUser = auth.currentUser;
+      return auth.currentUser;
+    }
+    try {
+      return await this.authInitPromise;
+    } catch {
+      const cred = await signInAnonymously(auth);
+      this.currentUser = cred.user;
+      return cred.user;
+    }
   }
 
   /**
