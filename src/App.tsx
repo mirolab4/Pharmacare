@@ -136,6 +136,20 @@ export default function App() {
   const [invoices, setInvoices] = useState<Invoice[]>(() => pharmacyStorage.getInvoices());
   const [vouchers, setVouchers] = useState<Voucher[]>(() => pharmacyStorage.getVouchers());
 
+  // Refresh all state from storage
+  const refreshAllState = useCallback(() => {
+    setSettings(pharmacyStorage.getSettings());
+    setProducts(pharmacyStorage.getProducts());
+    setCategories(pharmacyStorage.getCategories());
+    setManufacturers(pharmacyStorage.getManufacturers());
+    setIngredients(pharmacyStorage.getIngredients());
+    setBanks(pharmacyStorage.getBanks());
+    setCustomers(pharmacyStorage.getCustomers());
+    setSuppliers(pharmacyStorage.getSuppliers());
+    setInvoices(pharmacyStorage.getInvoices());
+    setVouchers(pharmacyStorage.getVouchers());
+  }, []);
+
   // Scanner & Modal States
   const [isScannerOpen, setIsScannerOpen] = useState(false);
   const [isContinuousScannerOn, setIsContinuousScannerOn] = useState(false);
@@ -232,20 +246,6 @@ export default function App() {
       document.documentElement.classList.remove('dark');
     }
   }, [settings.darkMode]);
-
-  // Refresh all state from storage
-  const refreshAllState = useCallback(() => {
-    setSettings(pharmacyStorage.getSettings());
-    setProducts(pharmacyStorage.getProducts());
-    setCategories(pharmacyStorage.getCategories());
-    setManufacturers(pharmacyStorage.getManufacturers());
-    setIngredients(pharmacyStorage.getIngredients());
-    setBanks(pharmacyStorage.getBanks());
-    setCustomers(pharmacyStorage.getCustomers());
-    setSuppliers(pharmacyStorage.getSuppliers());
-    setInvoices(pharmacyStorage.getInvoices());
-    setVouchers(pharmacyStorage.getVouchers());
-  }, []);
 
   // Listen to Firestore real-time sync updates across devices, remote data pull, and periodic silent cloud backup
   useEffect(() => {

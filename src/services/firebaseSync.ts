@@ -48,7 +48,8 @@ import {
   Manufacturer, 
   Ingredient, 
   StockMovement,
-  LinkedDevice
+  LinkedDevice,
+  MemberRole
 } from '../types/pharmacy';
 
 // 1. Initialize Firebase App
